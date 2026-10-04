@@ -959,6 +959,15 @@ fn windows_path_to_wsl(p: &str) -> Option<String> {
     Some(format!("/mnt/{drive}/{}", p[3..].replace('\\', "/")))
 }
 
+/// Decode the bundled app icon for `Window::with_window_icon`.
+fn window_icon() -> Option<winit::window::Icon> {
+    let png = include_bytes!("../assets/icon.png");
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+}
+
 /// Text to insert for a dropped file: WSL children get `/mnt/<drive>` paths
 /// and paths containing whitespace are double-quoted.
 fn drop_path_text(path: &std::path::Path, wsl: bool) -> String {
@@ -1254,6 +1263,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = Window::default_attributes()
             .with_title("dopaterm")
+            .with_window_icon(window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         window.set_ime_allowed(true);

@@ -23,6 +23,9 @@ unicode-width = "=0.2.2"
 wgpu = "30.0.1"
 winit = "0.30.13"
 
+[build-dependencies]
+embed-resource = "3"
+
 [target."cfg(windows)".dependencies.windows-sys]
 version = "0.59.0"
 features = [
