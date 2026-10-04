@@ -1,0 +1,22 @@
+# dopaterm configuration — save as <config dir>/dopaterm/config.toml
+# Linux/macOS: ~/.config/dopaterm/config.toml
+# Windows:     %APPDATA%\dopaterm\config.toml
+
+font_size = 14.0
+# font_family = "Cascadia Mono"   # default: auto-select a system monospace with box-drawing/symbols
+# shell = "powershell.exe"          # default: $SHELL / powershell.exe
+# shell_args = ["-NoLogo"]
+intensity = "normal"               # off | low | normal | max
+background = "#1d1f21"
+foreground = "#c5c8c6"
+
+[effects]
+sparks = true        # keystroke sparks + ring keyed by typed character
+shatter = true       # erased characters explode into shards + shockwave
+cursor_trail = true  # warp trail when the cursor jumps
+fireworks = true     # dual-stage fireworks when a command finishes (heuristic)
+wait_pulse = true    # breathing aura + drifting stars while waiting for input
+confetti = true      # vertical beam + rings + confetti on Enter
+output_rain = true   # shooting stars triggered by PTY output
+process_error = true # massive detonation when a child process exits with an error
+# lua_dir = "/path/to/effects"     # default: <config dir>/effects/*.lua

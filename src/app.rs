@@ -1,0 +1,1306 @@
+//! winit application: owns the window, renderer, terminal and effect manager.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use alacritty_terminal::event::{Event, WindowSize};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Point};
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::TermMode;
+use alacritty_terminal::tty::Shell;
+use alacritty_terminal::vte::ansi::CursorShape;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::window::{Window, WindowId};
+
+use crate::colors::{cell_colors, to_f32};
+use crate::config::{self, parse_rgb, Config};
+use crate::fx::{self, FxEvent, Instance, Manager};
+use crate::input::{decode_key, KeyKind};
+use crate::render::{Line, Renderer, Span};
+use crate::settings_ui;
+use crate::term_core::{EventProxy, TermCore, UserEvent};
+
+pub struct App {
+    cfg: Config,
+    proxy: EventLoopProxy<UserEvent>,
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    term: Option<TermCore>,
+    fx: Manager,
+    mods: ModifiersState,
+    /// Previous frame's cells: (char, fg, bg, bold), indexed line*cols+col.
+    snapshot: Vec<(char, [u8; 4], [u8; 4], bool)>,
+    /// Cached styled lines for the renderer; rebuilt per dirty row.
+    lines: Vec<Option<Line>>,
+    /// Rows whose text needs re-shaping this frame.
+    dirty_lines: Vec<bool>,
+    /// Cached cell background/cursor quads.
+    bgs: Vec<Instance>,
+    prev_offset: usize,
+    prev_cursor: Option<Point>,
+    /// Cell indices shattered proactively on Backspace/Delete; used to dedupe
+    /// against the diff-based erase detection for ~200ms.
+    predicted_erase: Vec<(usize, Instant)>,
+    last_frame: Instant,
+    dirty: bool,
+    last_cursor_px: (f32, f32),
+    /// Enter was pressed; becomes `command_running` when output arrives.
+    command_pending: bool,
+    /// A command produced output after Enter; quiet -> CommandDone.
+    command_running: bool,
+    last_output: Instant,
+    /// Last input or output activity; drives the Waiting indicator.
+    last_activity: Instant,
+    /// Last keystroke; CommandDone requires input idle too.
+    last_input: Instant,
+    last_wait_ping: Instant,
+    /// --screenshot target path; take shot after the terminal has rendered a few frames.
+    shot_path: Option<PathBuf>,
+    frames: u32,
+    demo_injected: bool,
+    /// Delayed exit after a child process error so the explosion can play.
+    pending_exit: Option<Instant>,
+    /// Current mouse position in pixels and cell coordinates.
+    mouse_px: (f32, f32),
+    mouse_cell: (usize, usize),
+    /// Currently held mouse button for drag reporting.
+    mouse_button: Option<u8>,
+    /// True while an IME composition is active (prevents duplicate key events).
+    ime_composing: bool,
+    ime_preedit: crate::ime::Preedit,
+    /// Settings overlay state.
+    show_settings: bool,
+    mouse_demo_done: bool,
+    /// Active hitboxes in the settings overlay for the current frame.
+    settings_hits: Vec<crate::settings_ui::Hit>,
+}
+
+impl App {
+    pub fn new(cfg: Config, proxy: EventLoopProxy<UserEvent>, shot_path: Option<PathBuf>) -> Self {
+        Self {
+            cfg,
+            proxy,
+            window: None,
+            renderer: None,
+            term: None,
+            fx: Manager::new(1.0),
+            mods: ModifiersState::empty(),
+            snapshot: Vec::new(),
+            lines: Vec::new(),
+            dirty_lines: Vec::new(),
+            bgs: Vec::new(),
+            prev_offset: usize::MAX,
+            prev_cursor: None,
+            predicted_erase: Vec::new(),
+            last_frame: Instant::now(),
+            dirty: true,
+            last_cursor_px: (0.0, 0.0),
+            command_pending: false,
+            command_running: false,
+            last_output: Instant::now(),
+            last_activity: Instant::now(),
+            last_input: Instant::now(),
+            last_wait_ping: Instant::now(),
+            shot_path,
+            frames: 0,
+            demo_injected: false,
+            pending_exit: None,
+            mouse_px: (0.0, 0.0),
+            mouse_cell: (0, 0),
+            mouse_button: None,
+            ime_composing: false,
+            ime_preedit: crate::ime::Preedit::default(),
+            show_settings: false,
+            mouse_demo_done: false,
+            settings_hits: Vec::new(),
+        }
+    }
+
+    fn cell_rect(&self, point: Point) -> (f32, f32, f32, f32) {
+        let r = self.renderer.as_ref().unwrap();
+        let x = point.column.0 as f32 * r.cell_w;
+        let y = point.line.0.max(0) as f32 * r.cell_h;
+        (x, y, r.cell_w, r.cell_h)
+    }
+
+    fn build_settings_overlay(&self) -> (Vec<Instance>, Vec<Line>, Vec<settings_ui::Hit>) {
+        let r = self.renderer.as_ref().unwrap();
+        let w = self.window.as_ref().unwrap().inner_size();
+        settings_ui::build(&self.cfg, w.width as f32, w.height as f32, r.cell_w, r.cell_h)
+    }
+
+    fn build_overlay(&self) -> (Vec<Instance>, Vec<Line>, Vec<settings_ui::Hit>) {
+        if self.show_settings {
+            return self.build_settings_overlay();
+        }
+        let r = self.renderer.as_ref().unwrap();
+        let size = self.window.as_ref().unwrap().inner_size();
+        let anchor = (self.last_cursor_px.0 - r.cell_w / 2.0, self.last_cursor_px.1 - r.cell_h / 2.0);
+        let (quads, lines) = self.ime_preedit.overlay(
+            anchor,
+            (r.cell_w, r.cell_h),
+            (size.width as f32, size.height as f32),
+            parse_rgb(&self.cfg.foreground),
+            parse_rgb(&self.cfg.background),
+        );
+        (quads, lines, Vec::new())
+    }
+
+    fn sync_ime(&mut self) {
+        if self.show_settings {
+            self.ime_preedit.clear();
+            self.ime_composing = false;
+        }
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(!self.show_settings);
+        }
+    }
+
+    fn resize_terminal_to_window(&mut self) {
+        let Some(r) = self.renderer.as_ref() else { return };
+        let Some(term) = &self.term else { return };
+        let size = self.window.as_ref().unwrap().inner_size();
+        let ws = alacritty_terminal::event::WindowSize {
+            num_cols: ((size.width as f32 / r.cell_w) as u16).max(1),
+            num_lines: ((size.height as f32 / r.cell_h) as u16).max(1),
+            cell_width: r.cell_w as u16,
+            cell_height: r.cell_h as u16,
+        };
+        term.resize(ws);
+        self.snapshot.clear();
+        self.dirty_lines = vec![true; self.lines.len().max(1)];
+        self.dirty = true;
+    }
+
+    fn update_effects(&mut self) {
+        self.fx.clear();
+        let scale = self.cfg.intensity.scale();
+        self.fx.set_scale(scale);
+        if scale <= 0.0 {
+            return;
+        }
+        if self.cfg.effects.sparks {
+            self.fx.push(Box::new(fx::builtin::Sparks::new()));
+        }
+        if self.cfg.effects.shatter {
+            self.fx.push(Box::new(fx::builtin::Shatter::new()));
+        }
+        if self.cfg.effects.cursor_trail {
+            self.fx.push(Box::new(fx::builtin::CursorTrail::new()));
+        }
+        if self.cfg.effects.fireworks {
+            self.fx.push(Box::new(fx::builtin::Fireworks::new()));
+        }
+        if self.cfg.effects.wait_pulse {
+            self.fx.push(Box::new(fx::builtin::WaitPulse::new()));
+        }
+        if self.cfg.effects.confetti {
+            self.fx.push(Box::new(fx::builtin::Confetti::new()));
+        }
+        if self.cfg.effects.output_rain {
+            self.fx.push(Box::new(fx::builtin::OutputRain::new()));
+        }
+        self.fx.push(Box::new(fx::builtin::BellFlash::new()));
+        if self.cfg.effects.process_error {
+            self.fx.push(Box::new(fx::builtin::ProcessError::new()));
+        }
+        let lua_dir = self.cfg.effects.lua_dir.clone()
+            .unwrap_or_else(|| config::config_dir().join("effects"));
+        if let Ok(dir) = std::fs::read_dir(&lua_dir) {
+            for entry in dir.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "lua") {
+                    match fx::lua_fx::LuaEffect::load(&path) {
+                        Ok(eff) => self.fx.push(Box::new(eff)),
+                        Err(e) => eprintln!("dopaterm: lua effect {} failed: {e}", path.display()),
+                    }
+                }
+            }
+        }
+    }
+
+    fn mouse_mode(&self, term: &TermCore) -> TermMode {
+        let mode = *term.term.lock().mode();
+        #[cfg(windows)]
+        if !crate::mouse::tracking_enabled(mode)
+            && term.child_pid.and_then(crate::mouse_inject::input_mode)
+                .is_some_and(crate::mouse_inject::native_tracking_enabled)
+        {
+            return mode | TermMode::MOUSE_MOTION;
+        }
+        mode
+    }
+
+    fn send_mouse_event(&self, term: &TermCore, button: u8, col: usize, line: usize, release: bool) {
+        let mode = self.mouse_mode(term);
+        let Some(seq) = crate::mouse::encode(
+            &mode,
+            button,
+            col,
+            line,
+            release,
+            self.mods.shift_key(),
+            self.mods.alt_key(),
+            self.mods.control_key(),
+        ) else {
+            return;
+        };
+        if std::env::var_os("DOPA_MOUSE_LOG").is_some() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/dopaterm_mouse.log")
+            {
+                let _ = writeln!(f, "btn={button} col={col} line={line} release={release} seq={seq:?}");
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let Some(pid) = term.child_pid else {
+                eprintln!("dopaterm: no child pid, cannot inject mouse event");
+                return;
+            };
+            if self.is_vt_bridge_child() || crate::mouse_inject::uses_vt_input(pid) {
+                if !crate::mouse_inject::send_vt_input(pid, &seq) {
+                    eprintln!("dopaterm: VT mouse injection failed pid={pid}");
+                }
+            } else {
+                let is_motion = button & 32 != 0;
+                let is_wheel = !release && (button == 64 || button == 65);
+                let btn = button & 0x3;
+                let (button_state, event_flags) = if release {
+                    (0, 0)
+                } else if is_wheel {
+                    let delta: i32 = if button == 64 { 120 } else { -120 };
+                    ((delta as u32) << 16, crate::mouse_inject::MOUSE_WHEELED)
+                } else {
+                    use crate::mouse_inject::{
+                        FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED,
+                        RIGHTMOST_BUTTON_PRESSED,
+                    };
+                    let state = match btn {
+                        0 => FROM_LEFT_1ST_BUTTON_PRESSED,
+                        1 => FROM_LEFT_2ND_BUTTON_PRESSED,
+                        2 => RIGHTMOST_BUTTON_PRESSED,
+                        _ => 0,
+                    };
+                    let flags = if is_motion { crate::mouse_inject::MOUSE_MOVED } else { 0 };
+                    (state, flags)
+                };
+                let mut ctrl = 0u32;
+                if self.mods.shift_key() {
+                    ctrl |= crate::mouse_inject::SHIFT_PRESSED;
+                }
+                if self.mods.control_key() {
+                    ctrl |= crate::mouse_inject::LEFT_CTRL_PRESSED;
+                }
+                if self.mods.alt_key() {
+                    ctrl |= crate::mouse_inject::LEFT_ALT_PRESSED;
+                }
+                if !crate::mouse_inject::send_mouse_event(
+                    pid, col as i16, line as i16, button_state, ctrl, event_flags,
+                ) {
+                    eprintln!("dopaterm: native mouse injection failed pid={pid}");
+                }
+            }
+            return;
+        }
+
+        #[cfg(not(windows))]
+        term.write(&seq);
+    }
+
+    /// True if the current shell is a VT bridge (wsl.exe / ssh.exe) where mouse
+    /// sequences must be delivered as raw bytes rather than Win32 records.
+    fn is_vt_bridge_child(&self) -> bool {
+        let prog = self
+            .cfg
+            .shell
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("powershell");
+        crate::mouse::is_vt_bridge(prog)
+    }
+
+    fn simulate_mouse_demo(&mut self) {
+        if self.mouse_demo_done {
+            return;
+        }
+        self.mouse_demo_done = true;
+        let Some(term) = self.term.as_ref() else { return };
+        // Move to a known cell and generate press / release / wheel events.
+        self.mouse_cell = (4, 2);
+        self.send_mouse_event(term, 0, self.mouse_cell.0, self.mouse_cell.1, false);
+        self.send_mouse_event(term, 0, self.mouse_cell.0, self.mouse_cell.1, true);
+        self.mouse_cell = (6, 3);
+        self.send_mouse_event(term, 64, self.mouse_cell.0, self.mouse_cell.1, false);
+        eprintln!("dopaterm: synthetic mouse events injected; exiting in 500ms");
+        self.pending_exit = Some(Instant::now() + Duration::from_millis(500));
+    }
+
+    fn handle_settings_click(&mut self) {
+        let (mx, my) = self.mouse_px;
+        let mut needs_font_reload = false;
+        let mut needs_effects = false;
+        for hit in &self.settings_hits {
+            let (x, y, w, h) = hit.rect;
+            if mx >= x && mx < x + w && my >= y && my < y + h {
+                match &hit.action {
+                    settings_ui::Action::Close => {
+                        self.show_settings = false;
+                    }
+                    settings_ui::Action::Intensity(_) |
+                    settings_ui::Action::Toggle(_) => {
+                        settings_ui::apply_action(&mut self.cfg, &hit.action);
+                        needs_effects = true;
+                    }
+                    settings_ui::Action::FontSize(_) |
+                    settings_ui::Action::FontNext => {
+                        settings_ui::apply_action(&mut self.cfg, &hit.action);
+                        needs_font_reload = true;
+                    }
+                    settings_ui::Action::ShellNext |
+                    settings_ui::Action::Theme(_) => {
+                        settings_ui::apply_action(&mut self.cfg, &hit.action);
+                    }
+                }
+                if needs_font_reload {
+                    let size = self.cfg.font_size;
+                    let family = self.cfg.font_family.clone();
+                    if let Some(r) = &mut self.renderer {
+                        r.set_font(size, family.as_deref());
+                    }
+                    self.resize_terminal_to_window();
+                }
+                if needs_effects {
+                    self.update_effects();
+                }
+                self.dirty = true;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                break;
+            }
+        }
+        self.sync_ime();
+    }
+
+    fn handle_term_event(&mut self, ev: Event, el: &ActiveEventLoop) {
+        if let Some(t) = self.pending_exit {
+            if Instant::now() >= t {
+                el.exit();
+                return;
+            }
+        }
+        let Some(term) = &self.term else { return };
+        match ev {
+            Event::Wakeup => {
+                let (ww, wh) = self.window.as_ref()
+                    .map(|w| {
+                        let s = w.inner_size();
+                        (s.width as f32, s.height as f32)
+                    })
+                    .unwrap_or((960.0, 600.0));
+                self.fx.event(&FxEvent::PtyOutput { n: 1, w: ww, h: wh });
+                let now = Instant::now();
+                self.last_output = now;
+                self.last_activity = now;
+                if self.command_pending {
+                    self.command_pending = false;
+                    self.command_running = true;
+                }
+                self.dirty = true;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Event::PtyWrite(text) => term.write(text.as_bytes()),
+            Event::Title(t) => {
+                if let Some(w) = &self.window {
+                    w.set_title(&t);
+                }
+            }
+            Event::ResetTitle => {
+                if let Some(w) = &self.window {
+                    w.set_title("dopaterm");
+                }
+            }
+            Event::ClipboardStore(_, text) => {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(text);
+                }
+            }
+            Event::ClipboardLoad(_, fmt) => {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    if let Ok(text) = cb.get_text() {
+                        term.write(fmt(&text).as_bytes());
+                    }
+                }
+            }
+            Event::ColorRequest(_, fmt) => {
+                // Respond with default black; full color reporting is a TODO.
+                term.write(fmt(alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 }).as_bytes());
+            }
+            Event::TextAreaSizeRequest(fmt) => {
+                if let Some(r) = &self.renderer {
+                    let w = self.window.as_ref().unwrap().inner_size();
+                    term.write(fmt(WindowSize {
+                        num_cols: (w.width as f32 / r.cell_w) as u16,
+                        num_lines: (w.height as f32 / r.cell_h) as u16,
+                        cell_width: r.cell_w as u16,
+                        cell_height: r.cell_h as u16,
+                    }).as_bytes());
+                }
+            }
+            Event::Bell => {
+                let (x, y) = self.last_cursor_px;
+                let r = self.renderer.as_ref().unwrap();
+                self.fx.event(&FxEvent::Bell { x, y, w: r.cell_w, h: r.cell_h });
+                self.dirty = true;
+            }
+            Event::ChildExit(status) => {
+                if !status.success() {
+                    let code = status.code().unwrap_or(1);
+                    let (cx, cy) = self.last_cursor_px;
+                    let (ww, wh) = self.window.as_ref()
+                        .map(|w| {
+                            let s = w.inner_size();
+                            (s.width as f32, s.height as f32)
+                        })
+                        .unwrap_or((960.0, 600.0));
+                    self.fx.event(&FxEvent::ChildError {
+                        x: cx,
+                        y: cy,
+                        w: ww,
+                        h: wh,
+                        status: code,
+                    });
+                    self.pending_exit = Some(Instant::now() + Duration::from_millis(1800));
+                    self.dirty = true;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                } else {
+                    el.exit();
+                }
+            }
+            Event::Exit => {
+                el.exit();
+            }
+            Event::MouseCursorDirty | Event::CursorBlinkingChange => {}
+        }
+    }
+
+    /// Diff the term grid against the cached snapshot, emit effect events, and
+    /// rebuild only the rows that changed (`self.lines`, `self.bgs`).
+    fn build_frame(&mut self) {
+        let term = self.term.as_ref().unwrap();
+        let renderer = self.renderer.as_ref().unwrap();
+        let guard = term.term.lock();
+        let content = guard.renderable_content();
+        let colors = content.colors;
+        let cursor = content.cursor;
+        let cursor_point = cursor.point;
+        let offset = content.display_offset;
+        let (cw, ch) = (renderer.cell_w, renderer.cell_h);
+        let default_fg = parse_rgb(&self.cfg.foreground);
+        let default_bg = parse_rgb(&self.cfg.background);
+        let def_fg4 = [default_fg[0], default_fg[1], default_fg[2], 255];
+        let def_bg4 = [default_bg[0], default_bg[1], default_bg[2], 255];
+        let cols = guard.columns();
+        let rows = guard.screen_lines();
+
+        if self.lines.len() != rows || self.snapshot.len() != cols * rows {
+            self.lines = vec![None; rows];
+            self.dirty_lines = vec![true; rows];
+            self.snapshot.clear();
+        }
+
+        // Pass 1: snapshot cells, detect erase events.
+        let mut snap = vec![(' ', def_fg4, def_bg4, false); cols * rows];
+        let scrolled = offset != self.prev_offset;
+        for indexed in content.display_iter {
+            let point = indexed.point;
+            let line = point.line.0;
+            if line < 0 || line as usize >= rows {
+                continue;
+            }
+            let cell = indexed.cell;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let (fg, bg) = cell_colors(cell, colors, default_fg, default_bg);
+            let bold = cell.flags.contains(Flags::BOLD);
+            let idx = line as usize * cols + point.column.0;
+            snap[idx] = (cell.c, fg, bg, bold);
+        }
+
+        if std::env::var_os("DOPA_DEBUG").is_some() {
+            let nonspace = snap.iter().filter(|c| c.0 != ' ').count();
+            eprintln!("dopaterm: nonspace={} scrolled={} rows={}", nonspace, scrolled, rows);
+        }
+
+        // Mass changes = scroll/redraw; suppress shatter storms.
+        if !scrolled {
+            let erased = find_erased(&self.snapshot, &snap);
+            if std::env::var_os("DOPA_DEBUG").is_some() && !erased.is_empty() {
+                eprintln!("dopaterm: erased {:?}", erased.iter().map(|e| e.1).collect::<String>());
+            }
+            self.predicted_erase.retain(|(_, at)| at.elapsed() < Duration::from_secs(1));
+            for (i, ch_, fg_) in erased {
+                // Skip cells already shattered by key-press prediction.
+                if self
+                    .predicted_erase
+                    .iter()
+                    .any(|(pi, at)| *pi == i && at.elapsed() < Duration::from_millis(200))
+                {
+                    continue;
+                }
+                let line = i / cols;
+                let col = i % cols;
+                self.fx.event(&FxEvent::Erased {
+                    ch: ch_,
+                    x: col as f32 * cw + cw / 2.0,
+                    y: line as f32 * ch + ch / 2.0,
+                    w: cw,
+                    h: ch,
+                    color: to_f32(fg_),
+                });
+            }
+        }
+
+        // Pass 2: mark dirty rows (cell diffs, scroll, cursor in/out).
+        if self.snapshot.is_empty() {
+            self.dirty_lines.iter_mut().for_each(|d| *d = true);
+        } else {
+            for (i, (old, new)) in self.snapshot.iter().zip(&snap).enumerate() {
+                if *old != *new {
+                    let line = i / cols;
+                    if line < rows {
+                        self.dirty_lines[line] = true;
+                    }
+                }
+            }
+        }
+        if scrolled {
+            self.dirty_lines.iter_mut().for_each(|d| *d = true);
+        }
+        if self.prev_cursor != Some(cursor_point) {
+            for p in [self.prev_cursor, Some(cursor_point)].into_iter().flatten() {
+                if p.line.0 >= 0 && (p.line.0 as usize) < rows {
+                    self.dirty_lines[p.line.0 as usize] = true;
+                }
+            }
+        }
+        self.prev_offset = offset;
+
+        // Rebuild dirty rows' spans from the snapshot. Flags stay set until
+        // the renderer consumes them after draw.
+        let mut any_dirty = false;
+        for i in 0..rows {
+            if !self.dirty_lines[i] {
+                continue;
+            }
+            any_dirty = true;
+            let mut spans: Vec<Span> = Vec::new();
+            let mut text = String::new();
+            let mut span_key: Option<([u8; 4], bool)> = None;
+            for col in 0..cols {
+                let (c, mut fg, bg, bold) = snap[i * cols + col];
+                if p_eq(cursor_point, i, col) && cursor.shape != CursorShape::Hidden {
+                    fg = bg;
+                }
+                if span_key != Some((fg, bold)) {
+                    if let Some((f, b)) = span_key.take() {
+                        if !text.is_empty() {
+                            spans.push(Span { text: std::mem::take(&mut text), fg: f, bold: b });
+                        }
+                    }
+                    span_key = Some((fg, bold));
+                }
+                text.push(c);
+            }
+            if let Some((f, b)) = span_key {
+                if !text.is_empty() {
+                    spans.push(Span { text, fg: f, bold: b });
+                }
+            }
+            self.lines[i] = Some(Line { top: i as f32 * ch, left: 0.0, spans });
+        }
+
+        // Rebuild cell background + cursor quads when content changed.
+        if any_dirty {
+            self.bgs.clear();
+            for i in 0..rows {
+                for col in 0..cols {
+                    let (_, fg, bg, _) = snap[i * cols + col];
+                    let is_cursor = p_eq(cursor_point, i, col)
+                        && cursor.shape != CursorShape::Hidden;
+                    let qcol = if is_cursor { fg } else { bg };
+                    if is_cursor || bg != def_bg4 {
+                        self.bgs.push(Instance {
+                            pos: [col as f32 * cw + cw / 2.0, i as f32 * ch + ch / 2.0],
+                            size: [cw, ch],
+                            rot: 0.0,
+                            kind: 0,
+                            color: to_f32(qcol),
+                        });
+                    }
+                }
+            }
+        }
+
+        self.snapshot = snap;
+
+        // Cursor move events.
+        if let Some(prev) = self.prev_cursor {
+            if prev != cursor_point {
+                let (px, py, w, h) = self.cell_rect(prev);
+                let dx = (cursor_point.column.0 as i32 - prev.column.0 as i32) as f32 * cw;
+                let dy = (cursor_point.line.0 - prev.line.0) as f32 * ch;
+                self.fx.event(&FxEvent::CursorMoved { x: px + w / 2.0, y: py + h / 2.0, w, h, dx, dy });
+            }
+        }
+        self.prev_cursor = Some(cursor_point);
+        self.last_cursor_px = (
+            cursor_point.column.0 as f32 * cw + cw / 2.0,
+            cursor_point.line.0.max(0) as f32 * ch + ch / 2.0,
+        );
+
+        drop(guard);
+        if let Some(window) = &self.window {
+            window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(
+                    self.last_cursor_px.0 - cw / 2.0,
+                    self.last_cursor_px.1 - ch / 2.0,
+                ),
+                winit::dpi::PhysicalSize::new(cw as u32, ch as u32),
+            );
+        }
+    }
+
+    /// Periodic (200ms) housekeeping driven by the Wake thread: emit
+    /// CommandDone when a command's output goes quiet, and Waiting pulses
+    /// while the terminal is idle.
+    fn check_timers(&mut self) {
+        let mut fired = false;
+        // Fire only when output AND input are quiet — popping fireworks while
+        // the user is mid-typing reads as a random screen flash.
+        if self.command_running
+            && self.last_output.elapsed() > Duration::from_millis(600)
+            && self.last_input.elapsed() > Duration::from_millis(600)
+        {
+            self.command_running = false;
+            let (x, y) = self.last_cursor_px;
+            self.fx.event(&FxEvent::CommandDone { x, y });
+            fired = true;
+        }
+        if self.last_activity.elapsed() > Duration::from_secs(3)
+            && self.last_wait_ping.elapsed() > Duration::from_millis(1500)
+        {
+            self.last_wait_ping = Instant::now();
+            let (x, y) = self.last_cursor_px;
+            self.fx.event(&FxEvent::Waiting { x, y });
+            fired = true;
+        }
+        if fired {
+            self.dirty = true;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+    }
+
+    /// Shatter the character that Backspace/Delete is about to remove, read
+    /// straight from the grid at key-press time. The diff-based path may miss
+    /// it when a shell erases and repaints within a single PTY burst.
+    fn predict_shatter(&mut self, col_offset: isize) {
+        let term = self.term.as_ref().unwrap();
+        let mut t = term.term.lock();
+        let pt = t.grid().cursor.point;
+        if pt.line.0 < 0 {
+            return;
+        }
+        let base_col = pt.column.0 as isize + col_offset;
+        if base_col < 0 {
+            return;
+        }
+        let default_fg = parse_rgb(&self.cfg.foreground);
+        let default_bg = parse_rgb(&self.cfg.background);
+        // Backspace scans left (nearest non-space cell), Delete scans right.
+        let cols_to_try: Vec<isize> = if col_offset < 0 {
+            (0..=8).map(|d| base_col - d).take_while(|c| *c >= 0).collect()
+        } else {
+            (0..=8).map(|d| base_col + d).collect()
+        };
+        for col in cols_to_try {
+            let target = Point::new(pt.line, Column(col as usize));
+            let Some((c, fg)) = doomed_cell(&mut t, target, default_fg, default_bg) else {
+                continue;
+            };
+            let (cw, ch) = {
+                let r = self.renderer.as_ref().unwrap();
+                (r.cell_w, r.cell_h)
+            };
+            self.fx.event(&FxEvent::Erased {
+                ch: c,
+                x: col as f32 * cw + cw / 2.0,
+                y: pt.line.0 as f32 * ch + ch / 2.0,
+                w: cw,
+                h: ch,
+                color: to_f32(fg),
+            });
+            let cols = t.columns();
+            self.predicted_erase
+                .push((pt.line.0 as usize * cols + col as usize, Instant::now()));
+            if self.predicted_erase.len() > 64 {
+                self.predicted_erase.drain(..32);
+            }
+            break;
+        }
+    }
+}
+
+/// Char + resolved fg of the cell at `point`, if it holds a printable glyph.
+fn doomed_cell<E: alacritty_terminal::event::EventListener>(
+    t: &mut alacritty_terminal::Term<E>,
+    point: Point,
+    def_fg: [u8; 3],
+    def_bg: [u8; 3],
+) -> Option<(char, [u8; 4])> {
+    let content = t.renderable_content();
+    for indexed in content.display_iter {
+        if indexed.point.line == point.line && indexed.point.column == point.column {
+            let cell = indexed.cell;
+            if cell.c != ' ' && !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                let (fg, _) = cell_colors(cell, content.colors, def_fg, def_bg);
+                return Some((cell.c, fg));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn p_eq(p: Point, line: usize, col: usize) -> bool {
+    p.line.0 == line as i32 && p.column.0 == col
+}
+
+type SnapCell = (char, [u8; 4], [u8; 4], bool);
+
+/// Cells that went non-space -> space between snapshots (candidate erases).
+/// Returns (cell_index, erased_char, old_fg). Suppressed when more than a
+/// third of the grid changed (scroll/redraw storms aren't deletions).
+fn find_erased(old: &[SnapCell], new: &[SnapCell]) -> Vec<(usize, char, [u8; 4])> {
+    if old.len() != new.len() || new.is_empty() {
+        return Vec::new();
+    }
+    let mut changed = 0usize;
+    let mut out = Vec::new();
+    for (i, (o, n)) in old.iter().zip(new.iter()).enumerate() {
+        if o.0 != n.0 {
+            changed += 1;
+            if o.0 != ' ' && n.0 == ' ' {
+                out.push((i, o.0, o.1));
+            }
+        }
+    }
+    if changed * 3 >= new.len() {
+        out.clear();
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::term_core::Dims;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::Processor;
+    use alacritty_terminal::Term;
+
+    fn cell(c: char) -> SnapCell {
+        (c, [255; 4], [0, 0, 0, 255], false)
+    }
+
+    fn feed(t: &mut Term<VoidListener>, bytes: &[u8]) {
+        let mut p = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        p.advance(t, bytes);
+    }
+
+    #[test]
+    fn doomed_cell_reads_grid() {
+        let mut t = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &Dims { cols: 80, lines: 24 },
+            VoidListener,
+        );
+        feed(&mut t, b"$ ab");
+        // Cursor sits at col 4; the cell a Backspace would delete is col 3 ('b').
+        let pt = t.grid().cursor.point;
+        assert_eq!(pt.column.0, 4);
+        let got = doomed_cell(&mut t, Point::new(pt.line, Column(3)), [255; 3], [0; 3]);
+        assert_eq!(got.map(|g| g.0), Some('b'));
+        // Blank cell -> None.
+        let blank = doomed_cell(&mut t, Point::new(pt.line, Column(4)), [255; 3], [0; 3]);
+        assert!(blank.is_none());
+    }
+
+    #[test]
+    fn backspace_erase_detected() {
+        // "$ x" then x erased -> single erase at index 2.
+        let old: Vec<SnapCell> = vec![cell('$'), cell(' '), cell('x'), cell(' ')];
+        let new: Vec<SnapCell> = vec![cell('$'), cell(' '), cell(' '), cell(' ')];
+        let er = find_erased(&old, &new);
+        assert_eq!(er.len(), 1);
+        assert_eq!(er[0].0, 2);
+        assert_eq!(er[0].1, 'x');
+    }
+
+    #[test]
+    fn overwrite_is_not_erase() {
+        let old: Vec<SnapCell> = vec![cell('a'), cell(' ')];
+        let new: Vec<SnapCell> = vec![cell('b'), cell(' ')];
+        assert!(find_erased(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn full_repaint_suppressed() {
+        // 2/4 cells changed incl. erases -> exceeds 1/3 threshold.
+        let old: Vec<SnapCell> = vec![cell('a'), cell('b'), cell('c'), cell('d')];
+        let new: Vec<SnapCell> = vec![cell(' '), cell('x'), cell(' '), cell('y')];
+        assert!(find_erased(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn size_mismatch_ignored() {
+        let old: Vec<SnapCell> = vec![cell('a')];
+        let new: Vec<SnapCell> = vec![cell(' '), cell(' ')];
+        assert!(find_erased(&old, &new).is_empty());
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes()
+            .with_title("dopaterm")
+            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
+        let window = Arc::new(el.create_window(attrs).expect("create window"));
+        window.set_ime_allowed(true);
+        let renderer = pollster::block_on(Renderer::new(
+            Arc::clone(&window),
+            self.cfg.font_size,
+            self.cfg.font_family.clone(),
+        ))
+        .expect("init renderer");
+
+        let size = window.inner_size();
+        let window_size = WindowSize {
+            num_cols: (size.width as f32 / renderer.cell_w) as u16,
+            num_lines: (size.height as f32 / renderer.cell_h) as u16,
+            cell_width: renderer.cell_w as u16,
+            cell_height: renderer.cell_h as u16,
+        };
+
+        let shell = match &self.cfg.shell {
+            Some(prog) => Some(Shell::new(prog.clone(), self.cfg.shell_args.clone())),
+            None => default_shell(),
+        };
+        let proxy = EventProxy::new(self.proxy.clone());
+        let term = TermCore::spawn(window_size, shell, proxy).expect("spawn pty");
+
+        // Built-in + Lua effects.
+        self.update_effects();
+
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.term = Some(term);
+
+        // 200ms heartbeat for idle/command-finish detection.
+        let wake_proxy = self.proxy.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(200));
+            if wake_proxy.send_event(UserEvent::Wake).is_err() {
+                break;
+            }
+        });
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+        if let Some(t) = self.pending_exit {
+            if Instant::now() >= t {
+                el.exit();
+                return;
+            }
+        }
+        let Some(term) = &self.term else { return };
+        match ev {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(r) = &mut self.renderer {
+                    r.resize(size.width, size.height);
+                    let ws = WindowSize {
+                        num_cols: ((size.width as f32 / r.cell_w) as u16).max(1),
+                        num_lines: ((size.height as f32 / r.cell_h) as u16).max(1),
+                        cell_width: r.cell_w as u16,
+                        cell_height: r.cell_h as u16,
+                    };
+                    term.resize(ws);
+                    self.snapshot.clear();
+                    self.dirty = true;
+                }
+            }
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed || event.repeat {
+                    return;
+                }
+                if event.logical_key == Key::Named(NamedKey::F1)
+                    || (self.mods.control_key() && self.mods.shift_key()
+                        && matches!(&event.logical_key, Key::Character(c) if c == "," || c == "<"))
+                {
+                    self.show_settings = !self.show_settings;
+                    self.sync_ime();
+                    self.dirty = true;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                if self.show_settings {
+                    if event.logical_key == Key::Named(NamedKey::Escape) {
+                        self.show_settings = false;
+                        self.sync_ime();
+                        self.dirty = true;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                if self.ime_composing {
+                    return;
+                }
+                let (app_cursor, alt_screen) = {
+                    let t = term.term.lock();
+                    (
+                        t.mode().contains(TermMode::APP_CURSOR),
+                        t.mode().contains(TermMode::ALT_SCREEN),
+                    )
+                };
+                // Paste shortcuts.
+                if self.mods.control_key() && self.mods.shift_key() {
+                    if let winit::keyboard::Key::Character(c) = &event.logical_key {
+                        if c.eq_ignore_ascii_case("v") {
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                if let Ok(text) = cb.get_text() {
+                                    term.write(text.as_bytes());
+                                }
+                            }
+                            return;
+                        }
+                        if c.eq_ignore_ascii_case("c") {
+                            // TODO: selection copy; selection not implemented yet.
+                            return;
+                        }
+                    }
+                }
+                if let Some(d) = decode_key(&event, self.mods, app_cursor) {
+                    term.write(&d.bytes);
+                    term.term.lock().scroll_display(Scroll::Bottom);
+                    let (x, y) = self.last_cursor_px;
+                    self.fx.event(&FxEvent::Key { kind: d.kind, ch: d.ch, x, y });
+                    let shatter_col = match &event.logical_key {
+                        Key::Named(NamedKey::Backspace) => Some(-1),
+                        Key::Named(NamedKey::Delete) => Some(0),
+                        _ => None,
+                    };
+                    if let Some(off) = shatter_col {
+                        self.predict_shatter(off);
+                    }
+                    self.last_activity = Instant::now();
+                    self.last_input = self.last_activity;
+                    // Enter on the normal screen marks a possible command.
+                    if d.kind == KeyKind::Enter && !alt_screen {
+                        self.command_pending = true;
+                    }
+                    if d.kind == KeyKind::Enter {
+                        let w = self.window.as_ref().unwrap().inner_size();
+                        self.fx.event(&FxEvent::Confetti {
+                            x,
+                            y,
+                            w: w.width as f32,
+                            h: w.height as f32,
+                        });
+                    }
+                    self.dirty = true;
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let Some(r) = self.renderer.as_ref() else { return };
+                let x = position.x as f32;
+                let y = position.y as f32;
+                self.mouse_px = (x, y);
+                self.mouse_cell = ((x / r.cell_w) as usize, (y / r.cell_h) as usize);
+                if self.show_settings {
+                    return;
+                }
+                let mode = self.mouse_mode(term);
+                if mode.contains(TermMode::MOUSE_MOTION)
+                    || (mode.contains(TermMode::MOUSE_DRAG) && self.mouse_button.is_some())
+                {
+                    let b = self.mouse_button.unwrap_or(3) | 32;
+                    let (col, line) = self.mouse_cell;
+                    self.send_mouse_event(term, b, col, line, false);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if self.show_settings {
+                    if state == ElementState::Pressed && button == WinitMouseButton::Left {
+                        self.handle_settings_click();
+                    }
+                    return;
+                }
+                let mode = self.mouse_mode(term);
+                if !crate::mouse::tracking_enabled(mode) {
+                    return;
+                }
+                let btn = match button {
+                    WinitMouseButton::Left => 0,
+                    WinitMouseButton::Middle => 1,
+                    WinitMouseButton::Right => 2,
+                    _ => return,
+                };
+                let (col, line) = self.mouse_cell;
+                let release = state == ElementState::Released;
+                if release {
+                    if let Some(b) = self.mouse_button.take() {
+                        self.send_mouse_event(term, b, col, line, true);
+                    }
+                } else {
+                    self.send_mouse_event(term, btn, col, line, false);
+                    self.mouse_button = Some(btn);
+                }
+            }
+            WindowEvent::Ime(ime) => {
+                if self.show_settings {
+                    self.ime_preedit.clear();
+                    self.ime_composing = false;
+                    return;
+                }
+                let starting_composition = cfg!(windows) && matches!(&ime, winit::event::Ime::Enabled);
+                if let Some(text) = self.ime_preedit.update(ime) {
+                    term.write(text.as_bytes());
+                    term.term.lock().scroll_display(Scroll::Bottom);
+                    let (x, y) = self.last_cursor_px;
+                    self.fx.event(&FxEvent::Key { kind: KeyKind::Char, ch: text.chars().next(), x, y });
+                }
+                self.ime_composing = starting_composition || self.ime_preedit.active();
+                self.last_activity = Instant::now();
+                self.last_input = self.last_activity;
+                self.dirty = true;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::Focused(false) => {
+                self.ime_preedit.clear();
+                self.ime_composing = false;
+                self.mods = ModifiersState::empty();
+                self.dirty = true;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let mode = self.mouse_mode(term);
+                if crate::mouse::tracking_enabled(mode) {
+                    let button = match delta {
+                        MouseScrollDelta::LineDelta(_, y) if y > 0.0 => 64,
+                        MouseScrollDelta::LineDelta(_, y) if y < 0.0 => 65,
+                        MouseScrollDelta::PixelDelta(p) if p.y > 0.0 => 64,
+                        MouseScrollDelta::PixelDelta(p) if p.y < 0.0 => 65,
+                        _ => return,
+                    };
+                    let (col, line) = self.mouse_cell;
+                    self.send_mouse_event(term, button, col, line, false);
+                    return;
+                }
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -y as i32,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        -(p.y as f32 / 20.0).round() as i32
+                    }
+                };
+                if lines != 0 {
+                    term.term.lock().scroll_display(Scroll::Delta(lines));
+                    self.dirty = true;
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(t) = self.pending_exit {
+                    if Instant::now() >= t {
+                        el.exit();
+                        return;
+                    }
+                }
+                self.frames += 1;
+                let now = Instant::now();
+                let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
+                self.last_frame = now;
+
+                self.build_frame();
+                let animating = self.fx.tick(dt);
+                let fx_instances: Vec<Instance> = self.fx.instances().to_vec();
+                let default_bg = parse_rgb(&self.cfg.background);
+                let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(default_bg));
+                let (overlay_bg, overlay_lines, hits) = self.build_overlay();
+                self.settings_hits = hits;
+                if let Some(r) = &mut self.renderer {
+                    if let Err(e) = r.render(clear, &self.bgs, &self.lines, &self.dirty_lines, &fx_instances, &overlay_bg, &overlay_lines) {
+                        eprintln!("dopaterm: render error: {e}");
+                    }
+                }
+                self.dirty_lines.iter_mut().for_each(|d| *d = false);
+                if animating || self.dirty || self.shot_path.is_some() {
+                    self.window.as_ref().unwrap().request_redraw();
+                    self.dirty = false;
+                }
+
+                // Optional synthetic mouse test for WSL/Linux verification.
+                if std::env::var_os("DOPA_MOUSE_DEMO").is_some()
+                    && self.frames == 30
+                    && !self.show_settings
+                    && !self.mouse_demo_done
+                {
+                    self.simulate_mouse_demo();
+                    return;
+                }
+
+                // Screenshot mode: let the shell settle, fire demo effects,
+                // then capture a frame and exit.
+                if let Some(path) = self.shot_path.clone() {
+                    if self.frames == 6 && !self.demo_injected {
+                        self.demo_injected = true;
+                        let (x, y) = self.last_cursor_px;
+                        let r = self.renderer.as_ref().unwrap();
+                        let (cw, ch) = (r.cell_w, r.cell_h);
+                        let ws = self.window.as_ref().unwrap().inner_size();
+                        for _ in 0..4 {
+                            self.fx.event(&FxEvent::Key { kind: crate::input::KeyKind::Char, ch: Some('x'), x, y });
+                        }
+                        self.fx.event(&FxEvent::Erased {
+                            ch: 'x',
+                            x: x + cw * 3.0,
+                            y,
+                            w: cw,
+                            h: ch,
+                            color: [1.0, 0.5, 0.3, 1.0],
+                        });
+                        self.fx.event(&FxEvent::CursorMoved {
+                            x,
+                            y,
+                            w: cw,
+                            h: ch,
+                            dx: cw * 8.0,
+                            dy: ch * 2.0,
+                        });
+                        self.fx.event(&FxEvent::Bell { x: x + cw * 8.0, y: y + ch * 2.0, w: cw, h: ch });
+                        self.fx.event(&FxEvent::CommandDone { x: x + 380.0, y: y + 340.0 });
+                        self.fx.event(&FxEvent::Waiting { x, y });
+                        self.fx.event(&FxEvent::ChildError {
+                            x: x + 220.0,
+                            y: y + 180.0,
+                            w: ws.width as f32,
+                            h: ws.height as f32,
+                            status: 1,
+                        });
+                        self.window.as_ref().unwrap().request_redraw();
+                    } else if self.frames >= if self.demo_injected { 12 } else { 30 }
+                        && (self.frames >= 150
+                            || self.snapshot.iter().any(|c| c.0 != ' ')
+                            || self.demo_injected)
+                    {
+                        if std::env::var_os("DOPA_IME_DEMO").is_some() {
+                            let text = "日本語入力中".to_string();
+                            let end = text.len();
+                            self.ime_preedit.update(winit::event::Ime::Preedit(text, Some((end, end))));
+                        }
+                        self.build_frame();
+                        self.fx.tick(0.05);
+                        let fx_instances: Vec<Instance> = self.fx.instances().to_vec();
+                        let w = self.window.as_ref().unwrap().inner_size();
+                        let default_bg = parse_rgb(&self.cfg.background);
+                        let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(default_bg));
+                        let (overlay_bg, overlay_lines, hits) = self.build_overlay();
+                        self.settings_hits = hits;
+                        let r = self.renderer.as_mut().unwrap();
+                        match r.screenshot(w.width, w.height, clear, &self.bgs, &self.lines, &fx_instances, &overlay_bg, &overlay_lines) {
+                            Ok(px) => {
+                                if let Err(e) = image::save_buffer(
+                                    &path,
+                                    &px,
+                                    w.width,
+                                    w.height,
+                                    image::ExtendedColorType::Rgba8,
+                                ) {
+                                    eprintln!("dopaterm: save screenshot: {e}");
+                                } else {
+                                    eprintln!("dopaterm: wrote {}", path.display());
+                                }
+                            }
+                            Err(e) => eprintln!("dopaterm: screenshot: {e}"),
+                        }
+                        el.exit();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
+        match ev {
+            UserEvent::Term(e) => self.handle_term_event(e, el),
+            UserEvent::Wake => {
+                self.check_timers();
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if let Some(t) = self.pending_exit {
+            if Instant::now() >= t {
+                el.exit();
+                return;
+            }
+            el.set_control_flow(ControlFlow::WaitUntil(t));
+            return;
+        }
+        // Keep animating while particles are alive; idle otherwise.
+        el.set_control_flow(ControlFlow::Wait);
+    }
+}
+
+#[cfg(not(windows))]
+fn default_shell() -> Option<Shell> {
+    let prog = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    Some(Shell::new(prog, vec!["-i".into()]))
+}
+
+#[cfg(windows)]
+fn default_shell() -> Option<Shell> {
+    Some(Shell::new("powershell.exe".into(), Vec::new()))
+}

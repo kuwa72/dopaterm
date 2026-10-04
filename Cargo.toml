@@ -1,0 +1,29 @@
+[package]
+name = "dopaterm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+anyhow = "1.0.104"
+arboard = "3.6.1"
+bytemuck = "1.25.2"
+crossbeam-channel = "0.5.17"
+crossterm = "0.28"
+glyphon = "0.12.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+mlua = { version = "0.12.1", features = ["lua54", "send", "vendored"] }
+pollster = "1.0.1"
+serde = "1.0.229"
+toml = "1.1.6"
+unicode-width = "=0.2.2"
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+[target."cfg(windows)".dependencies.windows-sys]
+version = "0.59.0"
+features = ["Win32_System_Console", "Win32_Foundation"]
+
+[[bin]]
+name = "mouse_test"
+path = "src/bin/mouse_test.rs"
