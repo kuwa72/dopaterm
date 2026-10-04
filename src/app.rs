@@ -959,6 +959,22 @@ fn windows_path_to_wsl(p: &str) -> Option<String> {
     Some(format!("/mnt/{drive}/{}", p[3..].replace('\\', "/")))
 }
 
+/// Text to insert for a dropped file: WSL children get `/mnt/<drive>` paths
+/// and paths containing whitespace are double-quoted.
+fn drop_path_text(path: &std::path::Path, wsl: bool) -> String {
+    let mut s = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    if wsl {
+        s = windows_path_to_wsl(&s).unwrap_or(s);
+    }
+    #[cfg(not(windows))]
+    let _ = wsl;
+    if s.chars().any(char::is_whitespace) {
+        s = format!("\"{s}\"");
+    }
+    s
+}
+
 /// The block cursor spans the whole glyph beneath it: a wide char's spacer
 /// cell ('\0') is covered when the cursor sits on its lead cell.
 fn cursor_covers(snap: &[SnapCell], cols: usize, cursor: Point, i: usize, col: usize) -> bool {
@@ -1125,6 +1141,28 @@ mod tests {
         // Buffer-line coordinates account for the scroll offset.
         let top = Selection { anchor: (0, 0), head: (0, 3), dragging: false };
         assert_eq!(selected_text(&snap, 6, 3, 1, &top), "aXc");
+    }
+
+    #[test]
+    fn dropped_file_path_is_quoted_when_it_has_whitespace() {
+        assert_eq!(
+            drop_path_text(std::path::Path::new("/tmp/a b.png"), false),
+            "\"/tmp/a b.png\""
+        );
+        assert_eq!(drop_path_text(std::path::Path::new("/tmp/ab.png"), false), "/tmp/ab.png");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn dropped_file_path_translates_for_wsl() {
+        assert_eq!(
+            drop_path_text(std::path::Path::new("C:\\tmp\\a.png"), true),
+            "/mnt/c/tmp/a.png"
+        );
+        assert_eq!(
+            drop_path_text(std::path::Path::new("C:\\tmp\\a b.png"), true),
+            "\"/mnt/c/tmp/a b.png\""
+        );
     }
 
     #[test]
@@ -1479,6 +1517,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+            }
+            WindowEvent::DroppedFile(path) => {
+                let text = drop_path_text(&path, self.is_vt_bridge_child());
+                self.paste_text(term, &text);
+                self.dirty = true;
+                self.window.as_ref().unwrap().request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let mode = self.mouse_mode(term);

@@ -20,6 +20,8 @@ GPU terminal emulator with input/output visual effects, written in Rust
 - `Ctrl+Shift+V` pastes text (bracketed paste when the app enables it);
   a clipboard image is saved to a temp PNG and its path is pasted for CLI
   agents (`/mnt/c/...` when the shell is `wsl.exe`)
+- File drag & drop inserts the file path (quoted when it contains spaces,
+  `/mnt/c/...` for `wsl.exe`)
 - IME input with preedit display and candidate window positioned at the
   cursor (Japanese input verified on Windows)
 - Fullwidth / CJK correct rendering: per-cell backgrounds, scrollback, and
