@@ -186,6 +186,14 @@ fn align_to_cell_grid(buffer: &mut Buffer, font_system: &mut FontSystem, cell_w:
     }
 }
 
+/// What happened to a frame: presented to the window, or skipped without
+/// error (the app escalates long skip streaks to a window rebuild).
+#[derive(Debug)]
+pub enum FrameOutcome {
+    Presented,
+    Skipped(&'static str),
+}
+
 impl Renderer {
     pub async fn new(window: Arc<Window>, font_size: f32, font_family: Option<String>) -> anyhow::Result<Self> {
         let size = window.inner_size();
@@ -492,7 +500,7 @@ impl Renderer {
         fx: &[Instance],
         overlay_bg: &[Instance],
         overlay_lines: &[Line],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<FrameOutcome> {
         use wgpu::CurrentSurfaceTexture as Cst;
         if self.gpu_fault.load(Ordering::Relaxed) {
             anyhow::bail!("GPU device faulted");
@@ -506,7 +514,9 @@ impl Renderer {
                     _ => anyhow::bail!("surface lost"),
                 }
             }
-            Cst::Timeout | Cst::Occluded | Cst::Validation => return Ok(()),
+            Cst::Timeout => return Ok(FrameOutcome::Skipped("timeout")),
+            Cst::Occluded => return Ok(FrameOutcome::Skipped("occluded")),
+            Cst::Validation => return Ok(FrameOutcome::Skipped("validation")),
         };
         let view = frame.texture.create_view(&Default::default());
         let (w, h) = (self.surface_config.width, self.surface_config.height);
@@ -518,7 +528,7 @@ impl Renderer {
         if self.gpu_fault.load(Ordering::Relaxed) {
             anyhow::bail!("GPU device faulted during present");
         }
-        Ok(())
+        Ok(FrameOutcome::Presented)
     }
 
     /// Render the same frame into an offscreen texture and read back RGBA8.

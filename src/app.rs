@@ -21,7 +21,7 @@ use crate::colors::{cell_colors, to_f32};
 use crate::config::{self, parse_rgb, Config};
 use crate::fx::{self, FxEvent, Instance, Manager};
 use crate::input::{decode_key, KeyKind};
-use crate::render::{Line, Renderer, Span};
+use crate::render::{FrameOutcome, Line, Renderer, Span};
 use crate::settings_ui;
 use crate::term_core::{EventProxy, TermCore, UserEvent};
 
@@ -54,6 +54,10 @@ pub struct App {
     /// Rebuild attempts since the last good frame; the first ones retry on
     /// the same window, repeated failure escalates to a window recreate.
     gpu_resets: u32,
+    /// Consecutive frames the surface declined to present (timeout /
+    /// occluded / validation). A long streak right after a rebuild means
+    /// the window's compositor binding is dead — escalate.
+    skipped_frames: u32,
     last_renderer_reset: Option<Instant>,
     frame_bg: [u8; 3],
     prev_offset: usize,
@@ -115,6 +119,7 @@ impl App {
             draw_quads: Vec::new(),
             render_failures: 0,
             gpu_resets: 0,
+            skipped_frames: 0,
             last_renderer_reset: None,
             frame_bg,
             prev_offset: usize::MAX,
@@ -1712,10 +1717,30 @@ impl ApplicationHandler<UserEvent> for App {
                         r.render(clear, &self.draw_quads, &self.lines, &self.dirty_lines, &fx_instances, &overlay_bg, &overlay_lines)
                     }));
                     match result {
-                        Ok(Ok(())) => {
+                        Ok(Ok(FrameOutcome::Presented)) => {
                             self.render_failures = 0;
                             self.gpu_resets = 0;
+                            self.skipped_frames = 0;
                             rendered = true;
+                        }
+                        Ok(Ok(FrameOutcome::Skipped(why))) => {
+                            self.skipped_frames += 1;
+                            if self.skipped_frames <= 10 {
+                                eprintln!("dopaterm: frame skipped: {why}");
+                            }
+                            // A rebuilt renderer whose frames never reach
+                            // the screen is presenting to a dead window —
+                            // escalate to a window recreate once per reset.
+                            let recent_reset = self
+                                .last_renderer_reset
+                                .is_some_and(|t| t.elapsed() < Duration::from_secs(10));
+                            if self.skipped_frames >= 60 && recent_reset {
+                                eprintln!("dopaterm: frames not reaching window; recreating window");
+                                self.skipped_frames = 0;
+                                self.recreate_window_and_renderer(el);
+                            } else if recent_reset {
+                                self.window.as_ref().unwrap().request_redraw();
+                            }
                         }
                         Ok(Err(e)) => self.note_render_failure(&e.to_string(), el),
                         Err(_) => self.note_render_failure("render panicked", el),
