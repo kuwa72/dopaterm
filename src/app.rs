@@ -51,6 +51,9 @@ pub struct App {
     /// Consecutive render failures; a GPU adapter/surface change is
     /// unrecoverable for the old device, so a full rebuild is scheduled.
     render_failures: u32,
+    /// Rebuild attempts since the last good frame; the first ones retry on
+    /// the same window, repeated failure escalates to a window recreate.
+    gpu_resets: u32,
     last_renderer_reset: Option<Instant>,
     frame_bg: [u8; 3],
     prev_offset: usize,
@@ -111,6 +114,7 @@ impl App {
             sel_quads: Vec::new(),
             draw_quads: Vec::new(),
             render_failures: 0,
+            gpu_resets: 0,
             last_renderer_reset: None,
             frame_bg,
             prev_offset: usize::MAX,
@@ -194,7 +198,15 @@ impl App {
                 .last_renderer_reset
                 .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
         {
-            self.recreate_window_and_renderer(el);
+            // Rebuild on the same window first; only escalate to a full
+            // window recreate when rebuilds keep failing.
+            self.gpu_resets += 1;
+            if self.gpu_resets >= 3 {
+                self.gpu_resets = 0;
+                self.recreate_window_and_renderer(el);
+            } else {
+                self.recreate_renderer();
+            }
             self.render_failures = 0;
             self.last_renderer_reset = Some(Instant::now());
         }
@@ -212,10 +224,11 @@ impl App {
         // Arc<Window> and keeps the HWND alive — left visible it would
         // sit on screen frozen forever.
         old_win.set_visible(false);
-        // The leaked surface can't be dropped without a wgpu-hal panic on
-        // a lost device — forget it; the OS reclaims it at exit.
+        // Dropping a lost-device renderer panics inside wgpu-hal's
+        // surface teardown, but the unwind still destroys the swapchain —
+        // a partial drop leaks whatever is left, which is fine.
         if let Some(old) = self.renderer.take() {
-            std::mem::forget(old);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(old)));
         }
         let mut attrs = Window::default_attributes()
             .with_title("dopaterm")
@@ -241,10 +254,20 @@ impl App {
     }
 
     /// Rebuild the renderer (instance/surface/adapter/device/pipelines)
-    /// after the GPU configuration changed underneath us.
+    /// after the GPU configuration changed underneath us, keeping the
+    /// same window.
     fn recreate_renderer(&mut self) {
         let Some(window) = self.window.clone() else { return };
         let size = window.inner_size();
+        // Drop the old renderer BEFORE creating the new surface. Its drop
+        // panics inside wgpu-hal on a lost device (unreleased acquire
+        // semaphores), but the unwind still runs NativeSwapchain::drop ->
+        // vkDestroySwapchainKHR, which releases the HWND. Without this the
+        // old swapchain stays bound and a second surface on the same
+        // window presents to nothing.
+        if let Some(old) = self.renderer.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(old)));
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pollster::block_on(Renderer::new(
                 window,
@@ -257,13 +280,7 @@ impl App {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     r.resize(size.width, size.height)
                 }));
-                // Dropping the old renderer panics inside wgpu-hal's
-                // swapchain Drop when the device was lost (its acquire
-                // semaphore is still referenced). The resources are dead
-                // anyway — leak it rather than crash.
-                if let Some(old) = self.renderer.replace(r) {
-                    std::mem::forget(old);
-                }
+                self.renderer = Some(r);
                 self.snapshot.clear();
                 self.dirty_lines.iter_mut().for_each(|d| *d = true);
                 self.resize_terminal_to_window();
@@ -1697,6 +1714,7 @@ impl ApplicationHandler<UserEvent> for App {
                     match result {
                         Ok(Ok(())) => {
                             self.render_failures = 0;
+                            self.gpu_resets = 0;
                             rendered = true;
                         }
                         Ok(Err(e)) => self.note_render_failure(&e.to_string(), el),
