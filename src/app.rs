@@ -181,9 +181,9 @@ impl App {
     }
 
     /// Count a failed or panicked frame; persistent failure rebuilds the
-    /// renderer. Terminal output is cheap to regenerate, so a frame that
-    /// can't be presented is simply dropped and redrawn.
-    fn note_render_failure(&mut self, why: &str) {
+    /// window + renderer. Terminal output is cheap to regenerate, so a
+    /// frame that can't be presented is simply dropped and redrawn.
+    fn note_render_failure(&mut self, why: &str, el: &ActiveEventLoop) {
         self.render_failures += 1;
         eprintln!("dopaterm: render error: {why}");
         if let Some(w) = self.window.as_ref() {
@@ -194,9 +194,49 @@ impl App {
                 .last_renderer_reset
                 .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
         {
-            self.recreate_renderer();
+            self.recreate_window_and_renderer(el);
             self.render_failures = 0;
             self.last_renderer_reset = Some(Instant::now());
+        }
+    }
+
+    /// After a device loss the window's compositor binding can be tied to
+    /// the dead adapter — a fresh surface on the same HWND may present to
+    /// nothing. Recreate the whole window; the PTY/shell keeps running
+    /// because TermCore is independent of the renderer.
+    fn recreate_window_and_renderer(&mut self, el: &ActiveEventLoop) {
+        let Some(old_win) = self.window.take() else { return };
+        let size = old_win.inner_size();
+        let pos = old_win.outer_position().ok();
+        // Hide the old window first: its leaked surface holds an
+        // Arc<Window> and keeps the HWND alive — left visible it would
+        // sit on screen frozen forever.
+        old_win.set_visible(false);
+        // The leaked surface can't be dropped without a wgpu-hal panic on
+        // a lost device — forget it; the OS reclaims it at exit.
+        if let Some(old) = self.renderer.take() {
+            std::mem::forget(old);
+        }
+        let mut attrs = Window::default_attributes()
+            .with_title("dopaterm")
+            .with_window_icon(window_icon())
+            .with_inner_size(size);
+        if let Some(p) = pos {
+            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(p.x, p.y));
+        }
+        match el.create_window(attrs) {
+            Ok(w) => {
+                let window = Arc::new(w);
+                window.set_ime_allowed(!self.show_settings);
+                self.window = Some(window);
+                self.recreate_renderer();
+                eprintln!("dopaterm: window recreated after GPU change");
+            }
+            Err(e) => {
+                eprintln!("dopaterm: window recreate failed: {e}");
+                old_win.set_visible(true);
+                self.window = Some(old_win);
+            }
         }
     }
 
@@ -1659,8 +1699,8 @@ impl ApplicationHandler<UserEvent> for App {
                             self.render_failures = 0;
                             rendered = true;
                         }
-                        Ok(Err(e)) => self.note_render_failure(&e.to_string()),
-                        Err(_) => self.note_render_failure("render panicked"),
+                        Ok(Err(e)) => self.note_render_failure(&e.to_string(), el),
+                        Err(_) => self.note_render_failure("render panicked", el),
                     }
                 }
                 // Only clear dirty rows when the frame actually presented —
