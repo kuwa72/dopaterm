@@ -1,0 +1,49 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: dopaterm-windows-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: dopaterm-macos-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: dopaterm-macos-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: dopaterm-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          strip "target/${{ matrix.target }}/release/dopaterm" || true
+          tar -czf "${{ matrix.asset }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" dopaterm
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/dopaterm.exe" -DestinationPath "${{ matrix.asset }}.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}.*

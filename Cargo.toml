@@ -2,6 +2,9 @@
 name = "dopaterm"
 version = "0.1.0"
 edition = "2024"
+description = "GPU terminal emulator with input/output visual effects"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kuwa72/dopaterm"
 
 [dependencies]
 alacritty_terminal = "0.26.0"
