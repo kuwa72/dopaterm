@@ -48,6 +48,10 @@ pub struct App {
     sel_quads: Vec<Instance>,
     /// `bgs` + `sel_quads` merged for the draw call; reused every frame.
     draw_quads: Vec<Instance>,
+    /// Consecutive render failures; a GPU adapter/surface change is
+    /// unrecoverable for the old device, so a full rebuild is scheduled.
+    render_failures: u32,
+    last_renderer_reset: Option<Instant>,
     frame_bg: [u8; 3],
     prev_offset: usize,
     prev_cursor: Option<Point>,
@@ -106,6 +110,8 @@ impl App {
             selection: None,
             sel_quads: Vec::new(),
             draw_quads: Vec::new(),
+            render_failures: 0,
+            last_renderer_reset: None,
             frame_bg,
             prev_offset: usize::MAX,
             prev_cursor: None,
@@ -171,6 +177,30 @@ impl App {
         }
         if let Some(window) = &self.window {
             window.set_ime_allowed(!self.show_settings);
+        }
+    }
+
+    /// Rebuild the renderer (instance/surface/adapter/device/pipelines)
+    /// after the GPU configuration changed underneath us.
+    fn recreate_renderer(&mut self) {
+        let Some(window) = self.window.clone() else { return };
+        let size = window.inner_size();
+        match pollster::block_on(Renderer::new(
+            window,
+            self.cfg.font_size,
+            self.cfg.font_family.clone(),
+        )) {
+            Ok(mut r) => {
+                r.resize(size.width, size.height);
+                self.renderer = Some(r);
+                self.snapshot.clear();
+                self.dirty_lines.iter_mut().for_each(|d| *d = true);
+                self.resize_terminal_to_window();
+                self.dirty = true;
+                self.window.as_ref().unwrap().request_redraw();
+                eprintln!("dopaterm: renderer re-initialized after GPU change");
+            }
+            Err(e) => eprintln!("dopaterm: renderer re-init failed: {e}"),
         }
     }
 
@@ -1582,8 +1612,24 @@ impl ApplicationHandler<UserEvent> for App {
                 self.draw_quads.extend_from_slice(&self.bgs);
                 self.draw_quads.extend_from_slice(&self.sel_quads);
                 if let Some(r) = &mut self.renderer {
-                    if let Err(e) = r.render(clear, &self.draw_quads, &self.lines, &self.dirty_lines, &fx_instances, &overlay_bg, &overlay_lines) {
-                        eprintln!("dopaterm: render error: {e}");
+                    match r.render(clear, &self.draw_quads, &self.lines, &self.dirty_lines, &fx_instances, &overlay_bg, &overlay_lines) {
+                        Ok(()) => self.render_failures = 0,
+                        Err(e) => {
+                            self.render_failures += 1;
+                            eprintln!("dopaterm: render error: {e}");
+                            // Keep retrying so an adapter/surface change can
+                            // recover; persistent failure rebuilds everything.
+                            self.window.as_ref().unwrap().request_redraw();
+                            if self.render_failures >= 3
+                                && self
+                                    .last_renderer_reset
+                                    .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+                            {
+                                self.recreate_renderer();
+                                self.render_failures = 0;
+                                self.last_renderer_reset = Some(Instant::now());
+                            }
+                        }
                     }
                 }
                 self.dirty_lines.iter_mut().for_each(|d| *d = false);

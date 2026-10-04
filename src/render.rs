@@ -186,16 +186,43 @@ impl Renderer {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window)?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            })
-            .await?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await?;
+        // An adapter can be reported lost mid-enumeration when the GPU
+        // configuration is changing (driver reset, hybrid-GPU switch), so
+        // retry before giving up.
+        let (adapter, device, queue) = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                let adapter = match instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: Some(&surface),
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(a) => a,
+                    Err(e) => {
+                        last_err = Some(e.into());
+                        continue;
+                    }
+                };
+                match adapter.request_device(&wgpu::DeviceDescriptor::default()).await {
+                    Ok((d, q)) => {
+                        result = Some((adapter, d, q));
+                        break;
+                    }
+                    Err(e) => last_err = Some(e.into()),
+                }
+            }
+            match result {
+                Some(r) => r,
+                None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no GPU adapter"))),
+            }
+        };
         let info = adapter.get_info();
         eprintln!("dopaterm: GPU backend {:?} on {}", info.backend, info.name);
 
@@ -212,7 +239,11 @@ impl Renderer {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            // AutoVsync prefers a non-blocking (mailbox) swapchain: Fifo can
+            // block inside get_current_texture when the GPU/surface is
+            // reconfigured underneath us (adapter switch, TDR, topology
+            // change), which froze the whole event loop.
+            present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
