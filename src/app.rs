@@ -217,7 +217,13 @@ impl App {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     r.resize(size.width, size.height)
                 }));
-                self.renderer = Some(r);
+                // Dropping the old renderer panics inside wgpu-hal's
+                // swapchain Drop when the device was lost (its acquire
+                // semaphore is still referenced). The resources are dead
+                // anyway — leak it rather than crash.
+                if let Some(old) = self.renderer.replace(r) {
+                    std::mem::forget(old);
+                }
                 self.snapshot.clear();
                 self.dirty_lines.iter_mut().for_each(|d| *d = true);
                 self.resize_terminal_to_window();
