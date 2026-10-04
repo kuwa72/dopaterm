@@ -4,6 +4,10 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing tag to attach the assets to (e.g. v0.1.0)"
+        required: false
 
 permissions:
   contents: write
@@ -20,7 +24,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: dopaterm-macos-aarch64
-          - os: macos-13
+          - os: macos-14
             target: x86_64-apple-darwin
             asset: dopaterm-macos-x86_64
           - os: ubuntu-latest
@@ -46,4 +50,5 @@ jobs:
         run: Compress-Archive -Path "target/${{ matrix.target }}/release/dopaterm.exe" -DestinationPath "${{ matrix.asset }}.zip"
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
           files: ${{ matrix.asset }}.*
