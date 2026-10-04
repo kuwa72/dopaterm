@@ -58,6 +58,9 @@ pub struct App {
     /// occluded / validation). A long streak right after a rebuild means
     /// the window's compositor binding is dead — escalate.
     skipped_frames: u32,
+    /// Log the first presented frame after a GPU recovery, so frozen-
+    // screen reports can distinguish "presents lost" from "no redraw".
+    presented_after_reset: bool,
     last_renderer_reset: Option<Instant>,
     frame_bg: [u8; 3],
     prev_offset: usize,
@@ -120,6 +123,7 @@ impl App {
             render_failures: 0,
             gpu_resets: 0,
             skipped_frames: 0,
+            presented_after_reset: true,
             last_renderer_reset: None,
             frame_bg,
             prev_offset: usize::MAX,
@@ -203,15 +207,10 @@ impl App {
                 .last_renderer_reset
                 .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
         {
-            // Rebuild on the same window first; only escalate to a full
-            // window recreate when rebuilds keep failing.
-            self.gpu_resets += 1;
-            if self.gpu_resets >= 3 {
-                self.gpu_resets = 0;
-                self.recreate_window_and_renderer(el);
-            } else {
-                self.recreate_renderer();
-            }
+            // A surface rebuilt on the same HWND can present to nothing:
+            // the window's compositor binding was tied to the dead
+            // adapter. Recreate the window directly — the PTY lives on.
+            self.recreate_window_and_renderer(el);
             self.render_failures = 0;
             self.last_renderer_reset = Some(Instant::now());
         }
@@ -291,6 +290,7 @@ impl App {
                 self.resize_terminal_to_window();
                 self.dirty = true;
                 self.window.as_ref().unwrap().request_redraw();
+                self.presented_after_reset = false;
                 eprintln!("dopaterm: renderer re-initialized after GPU change");
             }
             Ok(Err(e)) => eprintln!("dopaterm: renderer re-init failed: {e}"),
@@ -1721,6 +1721,10 @@ impl ApplicationHandler<UserEvent> for App {
                             self.render_failures = 0;
                             self.gpu_resets = 0;
                             self.skipped_frames = 0;
+                            if !self.presented_after_reset {
+                                self.presented_after_reset = true;
+                                eprintln!("dopaterm: frame presented after GPU recovery");
+                            }
                             rendered = true;
                         }
                         Ok(Ok(FrameOutcome::Skipped(why))) => {
