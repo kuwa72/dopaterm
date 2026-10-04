@@ -180,18 +180,43 @@ impl App {
         }
     }
 
+    /// Count a failed or panicked frame; persistent failure rebuilds the
+    /// renderer. Terminal output is cheap to regenerate, so a frame that
+    /// can't be presented is simply dropped and redrawn.
+    fn note_render_failure(&mut self, why: &str) {
+        self.render_failures += 1;
+        eprintln!("dopaterm: render error: {why}");
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
+        if self.render_failures >= 3
+            && self
+                .last_renderer_reset
+                .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+        {
+            self.recreate_renderer();
+            self.render_failures = 0;
+            self.last_renderer_reset = Some(Instant::now());
+        }
+    }
+
     /// Rebuild the renderer (instance/surface/adapter/device/pipelines)
     /// after the GPU configuration changed underneath us.
     fn recreate_renderer(&mut self) {
         let Some(window) = self.window.clone() else { return };
         let size = window.inner_size();
-        match pollster::block_on(Renderer::new(
-            window,
-            self.cfg.font_size,
-            self.cfg.font_family.clone(),
-        )) {
-            Ok(mut r) => {
-                r.resize(size.width, size.height);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pollster::block_on(Renderer::new(
+                window,
+                self.cfg.font_size,
+                self.cfg.font_family.clone(),
+            ))
+        }));
+        match result {
+            Ok(Ok(mut r)) => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    r.resize(size.width, size.height)
+                }));
                 self.renderer = Some(r);
                 self.snapshot.clear();
                 self.dirty_lines.iter_mut().for_each(|d| *d = true);
@@ -200,7 +225,8 @@ impl App {
                 self.window.as_ref().unwrap().request_redraw();
                 eprintln!("dopaterm: renderer re-initialized after GPU change");
             }
-            Err(e) => eprintln!("dopaterm: renderer re-init failed: {e}"),
+            Ok(Err(e)) => eprintln!("dopaterm: renderer re-init failed: {e}"),
+            Err(_) => eprintln!("dopaterm: renderer re-init panicked"),
         }
     }
 
@@ -1349,7 +1375,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
-                    r.resize(size.width, size.height);
+                    // surface.configure can panic on a dead device.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        r.resize(size.width, size.height)
+                    }));
                     let ws = WindowSize {
                         num_cols: ((size.width as f32 / r.cell_w) as u16).max(1),
                         num_lines: ((size.height as f32 / r.cell_h) as u16).max(1),
@@ -1611,28 +1640,28 @@ impl ApplicationHandler<UserEvent> for App {
                 self.draw_quads.clear();
                 self.draw_quads.extend_from_slice(&self.bgs);
                 self.draw_quads.extend_from_slice(&self.sel_quads);
+                let mut rendered = false;
                 if let Some(r) = &mut self.renderer {
-                    match r.render(clear, &self.draw_quads, &self.lines, &self.dirty_lines, &fx_instances, &overlay_bg, &overlay_lines) {
-                        Ok(()) => self.render_failures = 0,
-                        Err(e) => {
-                            self.render_failures += 1;
-                            eprintln!("dopaterm: render error: {e}");
-                            // Keep retrying so an adapter/surface change can
-                            // recover; persistent failure rebuilds everything.
-                            self.window.as_ref().unwrap().request_redraw();
-                            if self.render_failures >= 3
-                                && self
-                                    .last_renderer_reset
-                                    .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
-                            {
-                                self.recreate_renderer();
-                                self.render_failures = 0;
-                                self.last_renderer_reset = Some(Instant::now());
-                            }
+                    // A wgpu panic here would unwind through the winit
+                    // callback and kill the event loop — the exact "frozen
+                    // window" symptom — so treat it as a render failure too.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        r.render(clear, &self.draw_quads, &self.lines, &self.dirty_lines, &fx_instances, &overlay_bg, &overlay_lines)
+                    }));
+                    match result {
+                        Ok(Ok(())) => {
+                            self.render_failures = 0;
+                            rendered = true;
                         }
+                        Ok(Err(e)) => self.note_render_failure(&e.to_string()),
+                        Err(_) => self.note_render_failure("render panicked"),
                     }
                 }
-                self.dirty_lines.iter_mut().for_each(|d| *d = false);
+                // Only clear dirty rows when the frame actually presented —
+                // a dropped frame must re-upload its changed rows next time.
+                if rendered {
+                    self.dirty_lines.iter_mut().for_each(|d| *d = false);
+                }
                 if animating || self.dirty || self.shot_path.is_some() {
                     self.window.as_ref().unwrap().request_redraw();
                     self.dirty = false;

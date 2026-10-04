@@ -1,5 +1,6 @@
 //! GPU renderer: cell background quads -> glyphon text -> effect quads.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use glyphon::cosmic_text::{Align, Attrs, AttrsOwned, Family, Metrics, Shaping, Weight, Wrap};
@@ -121,6 +122,10 @@ pub struct Renderer {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    /// Set by the device-lost / uncaptured-error callbacks; a frame that
+    /// observes it treats the device as unrecoverable and bails so the app
+    /// rebuilds the renderer instead of presenting to a dead device.
+    gpu_fault: Arc<AtomicBool>,
     quad_pipeline: wgpu::RenderPipeline,
     quad_vb: wgpu::Buffer,
     uniform_buf: wgpu::Buffer,
@@ -223,6 +228,28 @@ impl Renderer {
                 None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no GPU adapter"))),
             }
         };
+        let gpu_fault = Arc::new(AtomicBool::new(false));
+        {
+            let f = gpu_fault.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                f.store(true, Ordering::Relaxed);
+                eprintln!("dopaterm: GPU device lost ({reason:?}): {msg}");
+            });
+        }
+        {
+            let f = gpu_fault.clone();
+            // Overrides the default handler, which panics on validation
+            // errors: a panic inside the redraw callback would kill the
+            // winit event loop and freeze the window.
+            device.on_uncaptured_error(Arc::new(move |e| {
+                // Validation errors are code bugs, not device faults —
+                // log them without triggering a rebuild.
+                if !matches!(e, wgpu::Error::Validation { .. }) {
+                    f.store(true, Ordering::Relaxed);
+                }
+                eprintln!("dopaterm: wgpu error: {e}");
+            }));
+        }
         let info = adapter.get_info();
         eprintln!("dopaterm: GPU backend {:?} on {}", info.backend, info.name);
 
@@ -373,6 +400,7 @@ impl Renderer {
             queue,
             surface,
             surface_config,
+            gpu_fault,
             quad_pipeline,
             quad_vb,
             uniform_buf,
@@ -466,6 +494,9 @@ impl Renderer {
         overlay_lines: &[Line],
     ) -> anyhow::Result<()> {
         use wgpu::CurrentSurfaceTexture as Cst;
+        if self.gpu_fault.load(Ordering::Relaxed) {
+            anyhow::bail!("GPU device faulted");
+        }
         let frame = match self.surface.get_current_texture() {
             Cst::Success(t) | Cst::Suboptimal(t) => t,
             Cst::Lost | Cst::Outdated => {
@@ -481,6 +512,9 @@ impl Renderer {
         let (w, h) = (self.surface_config.width, self.surface_config.height);
         self.draw(&view, w, h, clear, bg, lines, dirty, fx, overlay_bg, overlay_lines)?;
         self.queue.present(frame);
+        if self.gpu_fault.swap(false, Ordering::Relaxed) {
+            anyhow::bail!("GPU device faulted during present");
+        }
         Ok(())
     }
 
