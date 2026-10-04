@@ -512,7 +512,10 @@ impl Renderer {
         let (w, h) = (self.surface_config.width, self.surface_config.height);
         self.draw(&view, w, h, clear, bg, lines, dirty, fx, overlay_bg, overlay_lines)?;
         self.queue.present(frame);
-        if self.gpu_fault.swap(false, Ordering::Relaxed) {
+        // A faulted device never recovers: keep the flag set so every
+        // subsequent frame bails too (a stale surface may keep reporting
+        // Success while silently dropping presents).
+        if self.gpu_fault.load(Ordering::Relaxed) {
             anyhow::bail!("GPU device faulted during present");
         }
         Ok(())
