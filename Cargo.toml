@@ -1,6 +1,6 @@
 [package]
 name = "dopaterm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "GPU terminal emulator with input/output visual effects"
 license = "MIT OR Apache-2.0"
@@ -22,6 +22,9 @@ toml = "1.1.6"
 unicode-width = "=0.2.2"
 wgpu = "30.0.1"
 winit = "0.30.13"
+
+[build-dependencies]
+embed-resource = "3"
 
 [target."cfg(windows)".dependencies.windows-sys]
 version = "0.59.0"

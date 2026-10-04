@@ -1,5 +1,7 @@
 # dopaterm
 
+<img src="assets/icon.png" width="96" align="right" alt="dopaterm icon">
+
 GPU terminal emulator with input/output visual effects, written in Rust
 (wgpu + glyphon + alacritty_terminal).
 
