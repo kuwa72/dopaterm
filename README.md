@@ -14,6 +14,12 @@ GPU terminal emulator with input/output visual effects, written in Rust
   system monospace font at runtime
 - Mouse tracking (SGR / X10), including ConPTY bypass for native Windows
   console apps, `wsl.exe`, and `ssh.exe`
+- Terminal-side text selection: drag to select, `Ctrl+Shift+C` to copy;
+  inside mouse-aware applications `Shift`+drag selects at the terminal
+  level and `Shift`+wheel scrolls history instead
+- `Ctrl+Shift+V` pastes text (bracketed paste when the app enables it);
+  a clipboard image is saved to a temp PNG and its path is pasted for CLI
+  agents (`/mnt/c/...` when the shell is `wsl.exe`)
 - IME input with preedit display and candidate window positioned at the
   cursor (Japanese input verified on Windows)
 - Fullwidth / CJK correct rendering: per-cell backgrounds, scrollback, and

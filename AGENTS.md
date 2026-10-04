@@ -55,6 +55,7 @@ XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir ./target/debug/dopaterm --screenshot /tmp/
 
 - Settings overlay (F1) renders on top of the terminal using the same text/quads pipeline. It lets the user toggle effect intensity and each built-in effect at runtime.
 - Mouse tracking is supported: cursor coordinates are converted to cell positions, and SGR / X10 mouse protocol sequences are sent to the PTY when the application enables mouse mode. Mouse wheel forwards button events in mouse mode and scrolls history otherwise.
+- Terminal-side selection (`Selection` in `src/app.rs`) anchors drag ranges in buffer coordinates (row - display_offset), so it follows scroll. Shift+drag/wheel bypasses app mouse mode. `Ctrl+Shift+C` copies via `selected_text`; `Ctrl+Shift+V` pastes with bracketed-paste wrapping, saving clipboard images to a temp PNG and pasting its path (`/mnt/<drive>/...` for wsl.exe children).
 - `mouse_test` binary (`cargo build --bin mouse_test`) can be run inside dopaterm to verify mouse event delivery. Set `DOPA_MOUSE_LOG` to make dopaterm log outgoing mouse protocol bytes to `/tmp/dopaterm_mouse.log`.
 - On Windows, ConPTY does not translate SGR mouse sequences, so dopaterm bypasses it with `WriteConsoleInputW`: native console apps receive `MOUSE_EVENT` records, and VT bridges (wsl.exe / ssh.exe) receive the escape bytes as `KEY_EVENT` records.
 

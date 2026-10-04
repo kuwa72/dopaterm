@@ -41,6 +41,13 @@ pub struct App {
     dirty_lines: Vec<bool>,
     /// Cached cell background/cursor quads.
     bgs: Vec<Instance>,
+    /// Terminal-side mouse selection in buffer coordinates
+    /// (line = viewport row - display_offset; negative = scrollback).
+    selection: Option<Selection>,
+    /// Highlight quads for the active selection; rebuilt every frame.
+    sel_quads: Vec<Instance>,
+    /// `bgs` + `sel_quads` merged for the draw call; reused every frame.
+    draw_quads: Vec<Instance>,
     frame_bg: [u8; 3],
     prev_offset: usize,
     prev_cursor: Option<Point>,
@@ -96,6 +103,9 @@ impl App {
             lines: Vec::new(),
             dirty_lines: Vec::new(),
             bgs: Vec::new(),
+            selection: None,
+            sel_quads: Vec::new(),
+            draw_quads: Vec::new(),
             frame_bg,
             prev_offset: usize::MAX,
             prev_cursor: None,
@@ -330,6 +340,58 @@ impl App {
             .map(|s| s.as_str())
             .unwrap_or("powershell");
         crate::mouse::is_vt_bridge(prog)
+    }
+
+    /// Copy the active terminal selection to the clipboard.
+    fn copy_selection(&self) {
+        let Some(sel) = self.selection else { return };
+        let rows = self.lines.len();
+        if rows == 0 || self.snapshot.is_empty() {
+            return;
+        }
+        let cols = self.snapshot.len() / rows;
+        let Some(term) = self.term.as_ref() else { return };
+        let offset = term.term.lock().grid().display_offset();
+        let text = selected_text(&self.snapshot, cols, rows, offset, &sel);
+        if !text.is_empty() {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(text);
+            }
+        }
+    }
+
+    /// Paste clipboard content: an image becomes a PNG temp file whose path
+    /// is pasted (for CLI agents), otherwise text is pasted.
+    fn paste_clipboard(&self, term: &TermCore) {
+        let Ok(mut cb) = arboard::Clipboard::new() else { return };
+        if let Ok(img) = cb.get_image() {
+            if let Some(path) = save_clipboard_image(&img) {
+                #[cfg(windows)]
+                let path = if self.is_vt_bridge_child() {
+                    windows_path_to_wsl(&path).unwrap_or(path)
+                } else {
+                    path
+                };
+                self.paste_text(term, &path);
+                return;
+            }
+        }
+        if let Ok(text) = cb.get_text() {
+            self.paste_text(term, &text);
+        }
+    }
+
+    /// Write paste content to the PTY, wrapped in bracketed-paste markers
+    /// when the application enabled them.
+    fn paste_text(&self, term: &TermCore, text: &str) {
+        let bracketed = term.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        if bracketed {
+            term.write(b"\x1b[200~");
+        }
+        term.write(text.as_bytes());
+        if bracketed {
+            term.write(b"\x1b[201~");
+        }
     }
 
     fn simulate_mouse_demo(&mut self) {
@@ -666,6 +728,30 @@ impl App {
             }
         }
 
+        // Selection highlight quads; rebuilt every frame so they follow
+        // scrolling and drag updates.
+        self.sel_quads.clear();
+        if let Some(sel) = self.selection {
+            let ((sl, sc), (el, ec)) = sel.ordered();
+            for i in 0..rows {
+                let buf = i as i32 - offset as i32;
+                if buf < sl || buf > el {
+                    continue;
+                }
+                let c0 = if buf == sl { sc } else { 0 }.min(cols - 1);
+                let c1 = if buf == el { ec } else { cols - 1 }.min(cols - 1);
+                for col in c0..=c1 {
+                    self.sel_quads.push(Instance {
+                        pos: [col as f32 * cw + cw / 2.0, i as f32 * ch + ch / 2.0],
+                        size: [cw, ch],
+                        rot: 0.0,
+                        kind: 0,
+                        color: [0.30, 0.50, 0.85, 0.35],
+                    });
+                }
+            }
+        }
+
         self.snapshot = snap;
 
         // Cursor move events.
@@ -800,6 +886,77 @@ fn doomed_cell<E: alacritty_terminal::event::EventListener>(
 
 fn p_eq(p: Point, line: usize, col: usize) -> bool {
     p.line.0 == line as i32 && p.column.0 == col
+}
+
+/// A mouse selection over the terminal grid. Lines are buffer coordinates:
+/// viewport row minus display_offset (negative reaches into scrollback).
+#[derive(Clone, Copy)]
+struct Selection {
+    anchor: (i32, usize),
+    head: (i32, usize),
+    dragging: bool,
+}
+
+impl Selection {
+    fn ordered(&self) -> ((i32, usize), (i32, usize)) {
+        if self.anchor <= self.head { (self.anchor, self.head) } else { (self.head, self.anchor) }
+    }
+}
+
+/// Extract the selected text from a cell snapshot. Rows are joined with
+/// newlines; trailing whitespace per row and wide-char spacers are dropped.
+fn selected_text(
+    snap: &[SnapCell],
+    cols: usize,
+    rows: usize,
+    offset: usize,
+    sel: &Selection,
+) -> String {
+    let ((sl, sc), (el, ec)) = sel.ordered();
+    let mut lines_out: Vec<String> = Vec::new();
+    for buf in sl..=el {
+        let vis = buf + offset as i32;
+        if vis < 0 || vis as usize >= rows {
+            continue;
+        }
+        let vis = vis as usize;
+        let c0 = if buf == sl { sc } else { 0 }.min(cols - 1);
+        let c1 = if buf == el { ec } else { cols - 1 }.min(cols - 1);
+        let mut line = String::new();
+        for col in c0..=c1 {
+            let (c, ..) = snap[vis * cols + col];
+            if c != '\0' {
+                line.push(c);
+            }
+        }
+        lines_out.push(line.trim_end().to_string());
+    }
+    lines_out.join("\n")
+}
+
+/// Save a clipboard image as PNG and return its path (for CLI agents that
+/// read image files from a pasted path).
+fn save_clipboard_image(img: &arboard::ImageData) -> Option<String> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let path = std::env::temp_dir().join(format!("dopaterm-paste-{ms}.png"));
+    let rgba =
+        image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.to_vec())?;
+    rgba.save(&path).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// `C:\foo\bar` -> `/mnt/c/foo/bar` for shells running inside WSL.
+#[cfg(windows)]
+fn windows_path_to_wsl(p: &str) -> Option<String> {
+    let b = p.as_bytes();
+    if b.len() < 4 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+        return None;
+    }
+    let drive = (b[0] as char).to_ascii_lowercase();
+    Some(format!("/mnt/{drive}/{}", p[3..].replace('\\', "/")))
 }
 
 /// The block cursor spans the whole glyph beneath it: a wide char's spacer
@@ -943,6 +1100,42 @@ mod tests {
 
         // A spacer cell whose lead is not the cursor is never covered.
         assert!(!cursor_covers(&snap, 8, on_a, 0, 1));
+    }
+
+    #[test]
+    fn selection_extracts_visible_text() {
+        // 6 cols x 3 rows; row 1 has a wide-char spacer at col 1.
+        let mut snap = Vec::new();
+        for c in "hello ".chars() {
+            snap.push(cell(c));
+        }
+        for (i, c) in "aXXc  ".chars().enumerate() {
+            snap.push(cell(if i == 1 { '\0' } else { c }));
+        }
+        for c in "tail  ".chars() {
+            snap.push(cell(c));
+        }
+        let sel = Selection { anchor: (1, 1), head: (2, 3), dragging: false };
+        assert_eq!(selected_text(&snap, 6, 3, 0, &sel), "Xc\ntail");
+
+        // Reversed drag order selects the same region.
+        let rev = Selection { anchor: (2, 3), head: (1, 1), dragging: false };
+        assert_eq!(selected_text(&snap, 6, 3, 0, &rev), "Xc\ntail");
+
+        // Buffer-line coordinates account for the scroll offset.
+        let top = Selection { anchor: (0, 0), head: (0, 3), dragging: false };
+        assert_eq!(selected_text(&snap, 6, 3, 1, &top), "aXc");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_path_converts_to_wsl_mount() {
+        assert_eq!(
+            windows_path_to_wsl("C:\\Users\\y\\AppData\\Local\\Temp\\x.png").unwrap(),
+            "/mnt/c/Users/y/AppData/Local/Temp/x.png"
+        );
+        assert!(windows_path_to_wsl("/tmp/x.png").is_none());
+        assert!(windows_path_to_wsl("\\\\wsl$\\Ubuntu\\x").is_none());
     }
 
     #[test]
@@ -1128,19 +1321,15 @@ impl ApplicationHandler<UserEvent> for App {
                         t.mode().contains(TermMode::ALT_SCREEN),
                     )
                 };
-                // Paste shortcuts.
+                // Paste / copy shortcuts.
                 if self.mods.control_key() && self.mods.shift_key() {
                     if let winit::keyboard::Key::Character(c) = &event.logical_key {
                         if c.eq_ignore_ascii_case("v") {
-                            if let Ok(mut cb) = arboard::Clipboard::new() {
-                                if let Ok(text) = cb.get_text() {
-                                    term.write(text.as_bytes());
-                                }
-                            }
+                            self.paste_clipboard(term);
                             return;
                         }
                         if c.eq_ignore_ascii_case("c") {
-                            // TODO: selection copy; selection not implemented yet.
+                            self.copy_selection();
                             return;
                         }
                     }
@@ -1186,9 +1375,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.show_settings {
                     return;
                 }
+                if self.selection.as_ref().is_some_and(|s| s.dragging) {
+                    let off = term.term.lock().grid().display_offset() as i32;
+                    let sel = self.selection.as_mut().unwrap();
+                    sel.head = (self.mouse_cell.1 as i32 - off, self.mouse_cell.0);
+                    self.dirty = true;
+                    self.window.as_ref().unwrap().request_redraw();
+                    return;
+                }
                 let mode = self.mouse_mode(term);
-                if mode.contains(TermMode::MOUSE_MOTION)
-                    || (mode.contains(TermMode::MOUSE_DRAG) && self.mouse_button.is_some())
+                if !self.mods.shift_key()
+                    && (mode.contains(TermMode::MOUSE_MOTION)
+                        || (mode.contains(TermMode::MOUSE_DRAG) && self.mouse_button.is_some()))
                 {
                     let b = self.mouse_button.unwrap_or(3) | 32;
                     let (col, line) = self.mouse_cell;
@@ -1203,7 +1401,36 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let mode = self.mouse_mode(term);
-                if !crate::mouse::tracking_enabled(mode) {
+                let tracking = crate::mouse::tracking_enabled(mode);
+                // Terminal-side selection: used when the app is not tracking
+                // the mouse, or forced with Shift while it is.
+                if button == WinitMouseButton::Left {
+                    if state == ElementState::Pressed && (!tracking || self.mods.shift_key()) {
+                        let off = term.term.lock().grid().display_offset() as i32;
+                        let buf = self.mouse_cell.1 as i32 - off;
+                        self.selection = Some(Selection {
+                            anchor: (buf, self.mouse_cell.0),
+                            head: (buf, self.mouse_cell.0),
+                            dragging: true,
+                        });
+                        self.dirty = true;
+                        self.window.as_ref().unwrap().request_redraw();
+                        return;
+                    }
+                    if state == ElementState::Released
+                        && self.selection.as_ref().is_some_and(|s| s.dragging)
+                    {
+                        let sel = self.selection.as_mut().unwrap();
+                        sel.dragging = false;
+                        if sel.anchor == sel.head {
+                            self.selection = None;
+                        }
+                        self.dirty = true;
+                        self.window.as_ref().unwrap().request_redraw();
+                        return;
+                    }
+                }
+                if !tracking {
                     return;
                 }
                 let btn = match button {
@@ -1255,7 +1482,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let mode = self.mouse_mode(term);
-                if crate::mouse::tracking_enabled(mode) {
+                if crate::mouse::tracking_enabled(mode) && !self.mods.shift_key() {
                     let button = match delta {
                         MouseScrollDelta::LineDelta(_, y) if y > 0.0 => 64,
                         MouseScrollDelta::LineDelta(_, y) if y < 0.0 => 65,
@@ -1297,8 +1524,11 @@ impl ApplicationHandler<UserEvent> for App {
                 let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(self.frame_bg));
                 let (overlay_bg, overlay_lines, hits) = self.build_overlay();
                 self.settings_hits = hits;
+                self.draw_quads.clear();
+                self.draw_quads.extend_from_slice(&self.bgs);
+                self.draw_quads.extend_from_slice(&self.sel_quads);
                 if let Some(r) = &mut self.renderer {
-                    if let Err(e) = r.render(clear, &self.bgs, &self.lines, &self.dirty_lines, &fx_instances, &overlay_bg, &overlay_lines) {
+                    if let Err(e) = r.render(clear, &self.draw_quads, &self.lines, &self.dirty_lines, &fx_instances, &overlay_bg, &overlay_lines) {
                         eprintln!("dopaterm: render error: {e}");
                     }
                 }
@@ -1383,8 +1613,11 @@ impl ApplicationHandler<UserEvent> for App {
                         let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(self.frame_bg));
                         let (overlay_bg, overlay_lines, hits) = self.build_overlay();
                         self.settings_hits = hits;
+                        self.draw_quads.clear();
+                        self.draw_quads.extend_from_slice(&self.bgs);
+                        self.draw_quads.extend_from_slice(&self.sel_quads);
                         let r = self.renderer.as_mut().unwrap();
-                        match r.screenshot(w.width, w.height, clear, &self.bgs, &self.lines, &fx_instances, &overlay_bg, &overlay_lines) {
+                        match r.screenshot(w.width, w.height, clear, &self.draw_quads, &self.lines, &fx_instances, &overlay_bg, &overlay_lines) {
                             Ok(px) => {
                                 if let Err(e) = image::save_buffer(
                                     &path,
