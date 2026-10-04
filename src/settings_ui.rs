@@ -1,6 +1,8 @@
 //! Simple settings overlay rendered with the same text/quads pipeline as the
 //! terminal. Built at the start of each frame while it is open.
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::config::{Config, Intensity};
 use crate::fx::{Instance, SHAPE_RECT};
 use crate::render::{Line, Span};
@@ -25,19 +27,6 @@ const PADDING_X: f32 = 24.0;
 const PADDING_Y: f32 = 20.0;
 
 const SHELLS: &[&str] = &["/bin/bash", "/bin/zsh", "/usr/bin/fish", "/usr/bin/pwsh", "powershell.exe"];
-const FONTS: &[&str] = &[
-    "SauceCodePro Nerd Font",
-    "JetBrainsMono Nerd Font",
-    "FiraCode Nerd Font",
-    "Hack Nerd Font",
-    "DejaVu Sans Mono",
-    "Ubuntu Sans Mono",
-    "Ubuntu Mono",
-    "Noto Sans Mono",
-    "Cascadia Code",
-    "Cascadia Mono",
-    "Consolas",
-];
 const THEMES: &[(&str, &str, &str)] = &[
     ("dark", "#1d1f21", "#c5c8c6"),
     ("light", "#ffffff", "#000000"),
@@ -77,7 +66,21 @@ fn cycle_option<T: AsRef<str>>(current: Option<&str>, list: &[T]) -> Option<Stri
     }
 }
 
-pub fn build(cfg: &Config, ww: f32, wh: f32, cw: f32, ch: f32) -> (Vec<Instance>, Vec<Line>, Vec<Hit>) {
+fn font_label(family: Option<&str>) -> String {
+    let text = format!("Font: {}", family.unwrap_or("(system)"));
+    if text.width() <= 36 {
+        return text;
+    }
+    let mut columns = 0;
+    let mut label: String = text.chars().take_while(|ch| {
+        columns += ch.width().unwrap_or(0);
+        columns <= 35
+    }).collect();
+    label.push('…');
+    label
+}
+
+pub fn build(cfg: &Config, ww: f32, wh: f32, cw: f32, ch: f32, fonts: &[String]) -> (Vec<Instance>, Vec<Line>, Vec<Hit>) {
     let row_h = ch * 1.8;
     let rows = 16f32;
     let panel_h = rows * row_h + PADDING_Y * 2.0;
@@ -182,20 +185,23 @@ pub fn build(cfg: &Config, ww: f32, wh: f32, cw: f32, ch: f32) -> (Vec<Instance>
     y += row_h;
 
     // Font family row.
+    let font_family = crate::fonts::resolve_family(cfg.font_family.as_deref(), fonts);
     lines.push(Line {
         top: y,
         left: text_x,
-        spans: vec![Span { text: format!("Font: {}", cfg.font_family.as_deref().unwrap_or("(system)")), fg: text, bold: false }],
+        spans: vec![Span { text: font_label(font_family.as_deref()), fg: text, bold: false }],
     });
-    lines.push(Line {
-        top: y,
-        left: text_x + cw * 38.0,
-        spans: vec![Span { text: "[next]".into(), fg: text, bold: false }],
-    });
-    hits.push(Hit {
-        rect: (text_x + cw * 37.0, y - ch * 0.2, cw * 7.0, row_h),
-        action: Action::FontNext,
-    });
+    if !fonts.is_empty() {
+        lines.push(Line {
+            top: y,
+            left: text_x + cw * 38.0,
+            spans: vec![Span { text: "[next]".into(), fg: text, bold: false }],
+        });
+        hits.push(Hit {
+            rect: (text_x + cw * 37.0, y - ch * 0.2, cw * 7.0, row_h),
+            action: Action::FontNext,
+        });
+    }
     y += row_h;
 
     // Separator.
@@ -262,7 +268,7 @@ pub fn build(cfg: &Config, ww: f32, wh: f32, cw: f32, ch: f32) -> (Vec<Instance>
     (bgs, lines, hits)
 }
 
-pub fn apply_action(cfg: &mut Config, action: &Action) {
+pub fn apply_action(cfg: &mut Config, action: &Action, fonts: &[String]) {
     match action {
         Action::Intensity(i) => cfg.intensity = *i,
         Action::Toggle(field) => match *field {
@@ -289,8 +295,45 @@ pub fn apply_action(cfg: &mut Config, action: &Action) {
             cfg.font_size = (cfg.font_size + delta).clamp(4.0, 128.0);
         }
         Action::FontNext => {
-            cfg.font_family = cycle_option(cfg.font_family.as_deref(), FONTS);
+            let family = crate::fonts::resolve_family(cfg.font_family.as_deref(), fonts);
+            cfg.font_family = cycle_option(family.as_deref(), fonts);
         }
         Action::Close => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_selection_cycles_only_the_provided_system_catalog() {
+        let fonts = vec!["System Fixed A".to_string(), "System Fixed B".to_string()];
+        let mut cfg = Config::default();
+        for expected in [Some("System Fixed A"), Some("System Fixed B"), None, Some("System Fixed A")] {
+            apply_action(&mut cfg, &Action::FontNext, &fonts);
+            assert_eq!(cfg.font_family.as_deref(), expected);
+        }
+        cfg.font_family = Some("Unavailable Font".into());
+        apply_action(&mut cfg, &Action::FontNext, &fonts);
+        assert_eq!(cfg.font_family.as_deref(), Some("System Fixed A"));
+    }
+
+    #[test]
+    fn long_font_labels_do_not_overlap_the_selection_button() {
+        let label = font_label(Some(&"日本語等幅フォント".repeat(5)));
+        assert!(label.width() <= 36);
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn empty_catalog_has_no_font_selection_button() {
+        let mut cfg = Config::default();
+        cfg.font_family = Some("Unavailable Font".into());
+        let (_, lines, hits) = build(&cfg, 960.0, 600.0, 8.0, 18.0, &[]);
+        assert!(!hits.iter().any(|hit| matches!(hit.action, Action::FontNext)));
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| span.text == "Font: (system)"));
+        apply_action(&mut cfg, &Action::FontNext, &[]);
+        assert_eq!(cfg.font_family, None);
     }
 }

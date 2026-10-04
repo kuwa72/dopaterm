@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,21 +81,14 @@ impl Default for EffectsCfg {
 
 /// Pick a system monospace font that is likely to contain box-drawing and
 /// common UI symbols. Falls back to the platform's generic monospace.
-fn preferred_monospace_font() -> Option<String> {
-    #[cfg(windows)]
-    {
-        return Some("Cascadia Code".to_string());
+pub fn preferred_monospace_font(families: &[String]) -> Option<String> {
+    if cfg!(windows) {
+        for name in ["Cascadia Code", "Cascadia Mono", "Consolas"] {
+            if let Some(family) = crate::fonts::resolve_family(Some(name), families) {
+                return Some(family);
+            }
+        }
     }
-    let output = std::process::Command::new("fc-list")
-        .args([":", "family"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let families: HashSet<String> = text
-        .lines()
-        .flat_map(|line| line.split(','))
-        .map(|s| s.trim().to_string())
-        .collect();
     const CANDIDATES: &[&str] = &[
         "SauceCodePro Nerd Font",
         "JetBrainsMono Nerd Font",
@@ -112,15 +104,14 @@ fn preferred_monospace_font() -> Option<String> {
     ];
     CANDIDATES
         .iter()
-        .find(|&&name| families.contains(name))
-        .map(|s| s.to_string())
+        .find_map(|name| crate::fonts::resolve_family(Some(name), families))
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             font_size: 14.0,
-            font_family: preferred_monospace_font(),
+            font_family: None,
             shell: None,
             shell_args: Vec::new(),
             intensity: Intensity::Normal,

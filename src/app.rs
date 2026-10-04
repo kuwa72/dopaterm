@@ -41,6 +41,7 @@ pub struct App {
     dirty_lines: Vec<bool>,
     /// Cached cell background/cursor quads.
     bgs: Vec<Instance>,
+    frame_bg: [u8; 3],
     prev_offset: usize,
     prev_cursor: Option<Point>,
     /// Cell indices shattered proactively on Backspace/Delete; used to dedupe
@@ -82,6 +83,7 @@ pub struct App {
 
 impl App {
     pub fn new(cfg: Config, proxy: EventLoopProxy<UserEvent>, shot_path: Option<PathBuf>) -> Self {
+        let frame_bg = parse_rgb(&cfg.background);
         Self {
             cfg,
             proxy,
@@ -94,6 +96,7 @@ impl App {
             lines: Vec::new(),
             dirty_lines: Vec::new(),
             bgs: Vec::new(),
+            frame_bg,
             prev_offset: usize::MAX,
             prev_cursor: None,
             predicted_erase: Vec::new(),
@@ -131,7 +134,7 @@ impl App {
     fn build_settings_overlay(&self) -> (Vec<Instance>, Vec<Line>, Vec<settings_ui::Hit>) {
         let r = self.renderer.as_ref().unwrap();
         let w = self.window.as_ref().unwrap().inner_size();
-        settings_ui::build(&self.cfg, w.width as f32, w.height as f32, r.cell_w, r.cell_h)
+        settings_ui::build(&self.cfg, w.width as f32, w.height as f32, r.cell_w, r.cell_h, r.font_families())
     }
 
     fn build_overlay(&self) -> (Vec<Instance>, Vec<Line>, Vec<settings_ui::Hit>) {
@@ -358,17 +361,17 @@ impl App {
                     }
                     settings_ui::Action::Intensity(_) |
                     settings_ui::Action::Toggle(_) => {
-                        settings_ui::apply_action(&mut self.cfg, &hit.action);
+                        settings_ui::apply_action(&mut self.cfg, &hit.action, self.renderer.as_ref().unwrap().font_families());
                         needs_effects = true;
                     }
                     settings_ui::Action::FontSize(_) |
                     settings_ui::Action::FontNext => {
-                        settings_ui::apply_action(&mut self.cfg, &hit.action);
+                        settings_ui::apply_action(&mut self.cfg, &hit.action, self.renderer.as_ref().unwrap().font_families());
                         needs_font_reload = true;
                     }
                     settings_ui::Action::ShellNext |
                     settings_ui::Action::Theme(_) => {
-                        settings_ui::apply_action(&mut self.cfg, &hit.action);
+                        settings_ui::apply_action(&mut self.cfg, &hit.action, self.renderer.as_ref().unwrap().font_families());
                     }
                 }
                 if needs_font_reload {
@@ -444,9 +447,22 @@ impl App {
                     }
                 }
             }
-            Event::ColorRequest(_, fmt) => {
-                // Respond with default black; full color reporting is a TODO.
-                term.write(fmt(alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 }).as_bytes());
+            Event::ColorRequest(index, fmt) => {
+                let color = {
+                    let guard = term.term.lock();
+                    crate::colors::color_at_index(
+                        guard.renderable_content().colors,
+                        index,
+                        parse_rgb(&self.cfg.foreground),
+                        parse_rgb(&self.cfg.background),
+                    )
+                };
+                if let Some(color) = color {
+                    term.write(fmt(color).as_bytes());
+                } else {
+                    // Respond with default black; full color reporting is a TODO.
+                    term.write(fmt(alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 }).as_bytes());
+                }
             }
             Event::TextAreaSizeRequest(fmt) => {
                 if let Some(r) = &self.renderer {
@@ -506,13 +522,18 @@ impl App {
         let guard = term.term.lock();
         let content = guard.renderable_content();
         let colors = content.colors;
-        let cursor = content.cursor;
-        let cursor_point = cursor.point;
+        let mut cursor = content.cursor;
         let offset = content.display_offset;
+        cursor.point.line += offset as i32;
+        let cursor_point = cursor.point;
         let (cw, ch) = (renderer.cell_w, renderer.cell_h);
-        let default_fg = parse_rgb(&self.cfg.foreground);
-        let default_bg = parse_rgb(&self.cfg.background);
-        let def_fg4 = [default_fg[0], default_fg[1], default_fg[2], 255];
+        let (default_fg, default_bg) = crate::colors::default_colors(
+            colors,
+            parse_rgb(&self.cfg.foreground),
+            parse_rgb(&self.cfg.background),
+        );
+        let background_changed = self.frame_bg != default_bg;
+        self.frame_bg = default_bg;
         let def_bg4 = [default_bg[0], default_bg[1], default_bg[2], 255];
         let cols = guard.columns();
         let rows = guard.screen_lines();
@@ -524,26 +545,11 @@ impl App {
         }
 
         // Pass 1: snapshot cells, detect erase events.
-        let mut snap = vec![(' ', def_fg4, def_bg4, false); cols * rows];
+        let snap = snapshot_grid(&guard, default_fg, default_bg);
         let scrolled = offset != self.prev_offset;
-        for indexed in content.display_iter {
-            let point = indexed.point;
-            let line = point.line.0;
-            if line < 0 || line as usize >= rows {
-                continue;
-            }
-            let cell = indexed.cell;
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let (fg, bg) = cell_colors(cell, colors, default_fg, default_bg);
-            let bold = cell.flags.contains(Flags::BOLD);
-            let idx = line as usize * cols + point.column.0;
-            snap[idx] = (cell.c, fg, bg, bold);
-        }
 
         if std::env::var_os("DOPA_DEBUG").is_some() {
-            let nonspace = snap.iter().filter(|c| c.0 != ' ').count();
+            let nonspace = snap.iter().filter(|c| !matches!(c.0, ' ' | '\0')).count();
             eprintln!("dopaterm: nonspace={} scrolled={} rows={}", nonspace, scrolled, rows);
         }
 
@@ -614,6 +620,9 @@ impl App {
             let mut span_key: Option<([u8; 4], bool)> = None;
             for col in 0..cols {
                 let (c, mut fg, bg, bold) = snap[i * cols + col];
+                if c == '\0' {
+                    continue;
+                }
                 if p_eq(cursor_point, i, col) && cursor.shape != CursorShape::Hidden {
                     fg = bg;
                 }
@@ -636,12 +645,12 @@ impl App {
         }
 
         // Rebuild cell background + cursor quads when content changed.
-        if any_dirty {
+        if any_dirty || background_changed {
             self.bgs.clear();
             for i in 0..rows {
                 for col in 0..cols {
                     let (_, fg, bg, _) = snap[i * cols + col];
-                    let is_cursor = p_eq(cursor_point, i, col)
+                    let is_cursor = cursor_covers(&snap, cols, cursor_point, i, col)
                         && cursor.shape != CursorShape::Hidden;
                     let qcol = if is_cursor { fg } else { bg };
                     if is_cursor || bg != def_bg4 {
@@ -793,7 +802,45 @@ fn p_eq(p: Point, line: usize, col: usize) -> bool {
     p.line.0 == line as i32 && p.column.0 == col
 }
 
+/// The block cursor spans the whole glyph beneath it: a wide char's spacer
+/// cell ('\0') is covered when the cursor sits on its lead cell.
+fn cursor_covers(snap: &[SnapCell], cols: usize, cursor: Point, i: usize, col: usize) -> bool {
+    p_eq(cursor, i, col)
+        || (col > 0 && snap[i * cols + col].0 == '\0' && p_eq(cursor, i, col - 1))
+}
+
 type SnapCell = (char, [u8; 4], [u8; 4], bool);
+
+fn snapshot_grid<E: alacritty_terminal::event::EventListener>(
+    term: &alacritty_terminal::Term<E>,
+    default_fg: [u8; 3],
+    default_bg: [u8; 3],
+) -> Vec<SnapCell> {
+    let cols = term.columns();
+    let rows = term.screen_lines();
+    let content = term.renderable_content();
+    let fg = [default_fg[0], default_fg[1], default_fg[2], 255];
+    let bg = [default_bg[0], default_bg[1], default_bg[2], 255];
+    let mut snap = vec![(' ', fg, bg, false); cols * rows];
+    for indexed in content.display_iter {
+        let line = indexed.point.line.0 + content.display_offset as i32;
+        if line < 0 || line as usize >= rows {
+            continue;
+        }
+        let cell = indexed.cell;
+        let (fg, bg) = cell_colors(cell, content.colors, default_fg, default_bg);
+        let ch = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            '\0'
+        } else if cell.c == '\t' {
+            ' '
+        } else {
+            cell.c
+        };
+        snap[line as usize * cols + indexed.point.column.0] =
+            (ch, fg, bg, cell.flags.contains(Flags::BOLD));
+    }
+    snap
+}
 
 /// Cells that went non-space -> space between snapshots (candidate erases).
 /// Returns (cell_index, erased_char, old_fg). Suppressed when more than a
@@ -807,7 +854,7 @@ fn find_erased(old: &[SnapCell], new: &[SnapCell]) -> Vec<(usize, char, [u8; 4])
     for (i, (o, n)) in old.iter().zip(new.iter()).enumerate() {
         if o.0 != n.0 {
             changed += 1;
-            if o.0 != ' ' && n.0 == ' ' {
+            if !matches!(o.0, ' ' | '\0') && matches!(n.0, ' ' | '\0') {
                 out.push((i, o.0, o.1));
             }
         }
@@ -833,6 +880,88 @@ mod tests {
     fn feed(t: &mut Term<VoidListener>, bytes: &[u8]) {
         let mut p = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
         p.advance(t, bytes);
+    }
+
+    #[test]
+    fn fullwidth_spacer_keeps_the_character_background() {
+        let mut term = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &Dims { cols: 8, lines: 3 },
+            VoidListener,
+        );
+        feed(&mut term, "\x1b[48;2;38;42;49m日本".as_bytes());
+        let snap = snapshot_grid(&term, [255; 3], [29, 31, 33]);
+        assert_eq!(snap[0].2, [38, 42, 49, 255]);
+        assert_eq!(snap[1].2, snap[0].2);
+        assert_eq!(snap[3].2, snap[2].2);
+        assert_eq!(snap[1].0, '\0');
+        assert_eq!(snap[..4].iter().map(|cell| cell.0).filter(|ch| *ch != '\0').collect::<String>(), "日本");
+    }
+
+    #[test]
+    fn scrollback_cells_are_mapped_to_viewport_rows() {
+        let mut term = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &Dims { cols: 8, lines: 2 },
+            VoidListener,
+        );
+        feed(&mut term, b"\x1b[48;2;38;42;49mA\r\nB\r\nC");
+        term.scroll_display(Scroll::Delta(1));
+        assert_eq!(term.renderable_content().display_offset, 1);
+        let snap = snapshot_grid(&term, [255; 3], [29, 31, 33]);
+        assert_eq!(snap[0].0, 'A');
+        assert_eq!(snap[8].0, 'B');
+        assert_eq!(snap[0].2, [38, 42, 49, 255]);
+        term.scroll_display(Scroll::Bottom);
+        let snap = snapshot_grid(&term, [255; 3], [29, 31, 33]);
+        assert_eq!(snap[0].0, 'B');
+        assert_eq!(snap[8].0, 'C');
+    }
+
+    #[test]
+    fn block_cursor_covers_both_cells_of_a_wide_char() {
+        let mut term = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &Dims { cols: 8, lines: 3 },
+            VoidListener,
+        );
+        feed(&mut term, "日本ab".as_bytes());
+        let snap = snapshot_grid(&term, [255; 3], [0; 3]);
+        let line = alacritty_terminal::index::Line(0);
+
+        // Cursor on '本' (lead col 2, spacer col 3): both cells are covered.
+        let on_hon = Point::new(line, Column(2));
+        assert!(cursor_covers(&snap, 8, on_hon, 0, 2));
+        assert!(cursor_covers(&snap, 8, on_hon, 0, 3));
+        assert!(!cursor_covers(&snap, 8, on_hon, 0, 0));
+        assert!(!cursor_covers(&snap, 8, on_hon, 0, 4));
+
+        // Cursor on 'a' covers only its own cell.
+        let on_a = Point::new(line, Column(4));
+        assert!(cursor_covers(&snap, 8, on_a, 0, 4));
+        assert!(!cursor_covers(&snap, 8, on_a, 0, 5));
+
+        // A spacer cell whose lead is not the cursor is never covered.
+        assert!(!cursor_covers(&snap, 8, on_a, 0, 1));
+    }
+
+    #[test]
+    fn tabs_are_represented_by_the_grid_spaces_not_a_second_tab_stop() {
+        let mut term = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &Dims { cols: 16, lines: 2 },
+            VoidListener,
+        );
+        feed(&mut term, b"A\tB");
+        let snap = snapshot_grid(&term, [255; 3], [0; 3]);
+        assert_eq!(snap[..9].iter().map(|cell| cell.0).collect::<String>(), "A       B");
+    }
+
+    #[test]
+    fn spacer_removal_does_not_spawn_a_glyph_particle() {
+        let mut old = vec![cell(' '); 12];
+        old[2] = cell('\0');
+        assert!(find_erased(&old, &vec![cell(' '); 12]).is_empty());
     }
 
     #[test]
@@ -903,6 +1032,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.cfg.font_family.clone(),
         ))
         .expect("init renderer");
+        self.cfg.font_family = renderer.font_family().map(str::to_string);
 
         let size = window.inner_size();
         let window_size = WindowSize {
@@ -1164,8 +1294,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.build_frame();
                 let animating = self.fx.tick(dt);
                 let fx_instances: Vec<Instance> = self.fx.instances().to_vec();
-                let default_bg = parse_rgb(&self.cfg.background);
-                let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(default_bg));
+                let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(self.frame_bg));
                 let (overlay_bg, overlay_lines, hits) = self.build_overlay();
                 self.settings_hits = hits;
                 if let Some(r) = &mut self.renderer {
@@ -1233,6 +1362,15 @@ impl ApplicationHandler<UserEvent> for App {
                             || self.snapshot.iter().any(|c| c.0 != ' ')
                             || self.demo_injected)
                     {
+                        if std::env::var_os("DOPA_BACKGROUND_SCROLL_DEMO").is_some() {
+                            if let Some(term) = &self.term {
+                                term.term.lock().scroll_display(Scroll::Delta(3));
+                            }
+                        }
+                        if std::env::var_os("DOPA_SETTINGS_DEMO").is_some() {
+                            self.show_settings = true;
+                            self.sync_ime();
+                        }
                         if std::env::var_os("DOPA_IME_DEMO").is_some() {
                             let text = "日本語入力中".to_string();
                             let end = text.len();
@@ -1242,8 +1380,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.fx.tick(0.05);
                         let fx_instances: Vec<Instance> = self.fx.instances().to_vec();
                         let w = self.window.as_ref().unwrap().inner_size();
-                        let default_bg = parse_rgb(&self.cfg.background);
-                        let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(default_bg));
+                        let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(self.frame_bg));
                         let (overlay_bg, overlay_lines, hits) = self.build_overlay();
                         self.settings_hits = hits;
                         let r = self.renderer.as_mut().unwrap();

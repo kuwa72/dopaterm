@@ -2,7 +2,7 @@
 
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 const NORMAL: [[u8; 3]; 8] = [
     [0x1d, 0x1f, 0x21], // black
@@ -63,6 +63,28 @@ fn named_rgb(n: NamedColor, default_fg: [u8; 3], default_bg: [u8; 3]) -> [u8; 3]
         _ if (259..267).contains(&i) => dim(NORMAL[i - 259]),
         _ => default_fg,
     }
+}
+
+pub fn default_colors(colors: &Colors, foreground: [u8; 3], background: [u8; 3]) -> ([u8; 3], [u8; 3]) {
+    let foreground = colors[NamedColor::Foreground].map_or(foreground, |rgb| [rgb.r, rgb.g, rgb.b]);
+    let background = colors[NamedColor::Background].map_or(background, |rgb| [rgb.r, rgb.g, rgb.b]);
+    (foreground, background)
+}
+
+pub fn color_at_index(colors: &Colors, index: usize, foreground: [u8; 3], background: [u8; 3]) -> Option<Rgb> {
+    if index >= alacritty_terminal::term::color::COUNT {
+        return None;
+    }
+    if let Some(rgb) = colors[index] {
+        return Some(rgb);
+    }
+    let rgb = match index {
+        0..=255 => ansi256(index as u8),
+        i if i == NamedColor::Foreground as usize || i == NamedColor::Cursor as usize => foreground,
+        i if i == NamedColor::Background as usize => background,
+        _ => return None,
+    };
+    Some(Rgb { r: rgb[0], g: rgb[1], b: rgb[2] })
 }
 
 /// Resolve a cell's display (fg, bg) honoring INVERSE/BOLD/DIM/HIDDEN flags
@@ -132,4 +154,39 @@ pub fn srgb_to_linear(c: [f32; 4]) -> [f32; 4] {
         }
     };
     [f(c[0]), f(c[1]), f(c[2]), c[3]]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osc_background_is_shared_by_canvas_cells_and_color_queries() {
+        let mut colors = Colors::default();
+        let background = Rgb { r: 38, g: 42, b: 49 };
+        colors[NamedColor::Background] = Some(background);
+        let (fg, bg) = default_colors(&colors, [197, 200, 198], [29, 31, 33]);
+        assert_eq!(bg, [38, 42, 49]);
+        assert_eq!(cell_colors(&Cell::default(), &colors, fg, bg).1, [38, 42, 49, 255]);
+        assert_eq!(color_at_index(&colors, NamedColor::Background as usize, fg, bg), Some(background));
+        colors[NamedColor::Background] = None;
+        assert_eq!(default_colors(&colors, [197, 200, 198], [29, 31, 33]).1, [29, 31, 33]);
+    }
+
+    #[test]
+    fn default_color_query_does_not_report_black() {
+        let colors = Colors::default();
+        let rgb = color_at_index(&colors, NamedColor::Background as usize, [197, 200, 198], [29, 31, 33]);
+        assert_eq!(rgb, Some(Rgb { r: 29, g: 31, b: 33 }));
+        assert_eq!(color_at_index(&colors, usize::MAX, [255; 3], [0; 3]), None);
+    }
+
+    #[test]
+    fn fullwidth_spacer_respects_inverse_background() {
+        let mut cell = Cell::default();
+        cell.flags = Flags::WIDE_CHAR_SPACER | Flags::INVERSE;
+        cell.fg = Color::Spec(Rgb { r: 80, g: 90, b: 100 });
+        cell.bg = Color::Spec(Rgb { r: 38, g: 42, b: 49 });
+        assert_eq!(cell_colors(&cell, &Colors::default(), [255; 3], [0; 3]).1, [80, 90, 100, 255]);
+    }
 }

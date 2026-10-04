@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use glyphon::cosmic_text::{Align, Attrs, Family, Metrics, Shaping, Weight};
+use glyphon::cosmic_text::{Align, Attrs, AttrsOwned, Family, Metrics, Shaping, Weight, Wrap};
+use unicode_width::UnicodeWidthStr;
 use glyphon::{
     Buffer, Cache, Color as GColor, FontSystem, Resolution, SwashCache, TextArea, TextAtlas,
     TextBounds, TextRenderer, Viewport,
@@ -134,13 +135,51 @@ pub struct Renderer {
     atlas: TextAtlas,
     viewport: Viewport,
     text_renderer: TextRenderer,
+    overlay_text_renderer: TextRenderer,
     pub cell_w: f32,
     pub cell_h: f32,
     font_size: f32,
     font_family: Option<String>,
+    font_families: Vec<String>,
 }
 
 const MAX_INSTANCES: usize = 1 << 16;
+
+fn grid_text_buffer(font_system: &mut FontSystem, metrics: Metrics, width: f32) -> Buffer {
+    let mut buffer = Buffer::new(font_system, metrics);
+    buffer.set_size(Some(width), Some(metrics.line_height));
+    buffer.set_wrap(Wrap::None);
+    buffer
+}
+
+fn align_to_cell_grid(buffer: &mut Buffer, font_system: &mut FontSystem, cell_w: f32) {
+    buffer.shape_until_scroll(font_system, false);
+    let mut changed = false;
+    for line in &mut buffer.lines {
+        let adjustments: Vec<_> = line.layout_opt().into_iter().flatten()
+            .flat_map(|layout| &layout.glyphs)
+            .filter_map(|glyph| {
+                let width = line.text()[glyph.start..glyph.end].width() as f32 * cell_w;
+                let spacing = (width - glyph.w) / glyph.font_size;
+                if spacing.abs() < 0.0001 {
+                    return None;
+                }
+                let attrs = line.attrs_list().get_span(glyph.start).letter_spacing(spacing);
+                Some((glyph.start..glyph.end, AttrsOwned::new(&attrs)))
+            }).collect();
+        if adjustments.is_empty() {
+            continue;
+        }
+        let mut attrs = line.attrs_list().clone();
+        for (range, adjustment) in adjustments {
+            attrs.add_span(range, &adjustment.as_attrs());
+        }
+        changed |= line.set_attrs_list(attrs);
+    }
+    if changed {
+        buffer.shape_until_scroll(font_system, false);
+    }
+}
 
 impl Renderer {
     pub async fn new(window: Arc<Window>, font_size: f32, font_family: Option<String>) -> anyhow::Result<Self> {
@@ -284,11 +323,16 @@ impl Renderer {
         };
 
         let font_system = FontSystem::new();
+        let font_families = crate::fonts::monospace_families(font_system.db());
+        let font_family = crate::fonts::resolve_family(font_family.as_deref(), &font_families)
+            .or_else(|| crate::config::preferred_monospace_font(&font_families));
         let cache = Cache::new(&device);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let viewport = Viewport::new(&device, &cache);
         let swash = SwashCache::new();
         let text_renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let overlay_text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
         let bg_instances = mk_inst("bg instances");
@@ -311,10 +355,12 @@ impl Renderer {
             atlas,
             viewport,
             text_renderer,
+            overlay_text_renderer,
             cell_w: 8.0,
             cell_h: 16.0,
             font_size,
             font_family,
+            font_families,
         };
         r.measure_cell();
         Ok(r)
@@ -344,9 +390,17 @@ impl Renderer {
         );
     }
 
+    pub fn font_families(&self) -> &[String] {
+        &self.font_families
+    }
+
+    pub fn font_family(&self) -> Option<&str> {
+        self.font_family.as_deref()
+    }
+
     pub fn set_font(&mut self, size: f32, family: Option<&str>) {
         self.font_size = size.max(4.0);
-        self.font_family = family.map(|s| s.to_string());
+        self.font_family = crate::fonts::resolve_family(family, &self.font_families);
         self.line_bufs.clear();
         self.measure_cell();
     }
@@ -535,8 +589,7 @@ impl Renderer {
             let is_dirty = dirty.get(i).copied().unwrap_or(true);
             match line {
                 Some(line) if is_dirty => {
-                    let mut buf = Buffer::new(&mut self.font_system, metrics);
-                    buf.set_size(Some(width as f32), Some(metrics.line_height));
+                    let mut buf = grid_text_buffer(&mut self.font_system, metrics, width as f32);
                     let spans: Vec<(&str, Attrs)> = line
                         .spans
                         .iter()
@@ -551,7 +604,7 @@ impl Renderer {
                         })
                         .collect();
                     buf.set_rich_text(spans, &default_attrs, Shaping::Basic, Some(Align::Left));
-                    buf.shape_until_scroll(&mut self.font_system, false);
+                    align_to_cell_grid(&mut buf, &mut self.font_system, self.cell_w);
                     self.line_bufs[i] = Some(buf);
                 }
                 None if is_dirty => self.line_bufs[i] = None,
@@ -562,8 +615,7 @@ impl Renderer {
         // Build overlay text buffers fresh each frame.
         let mut overlay_bufs: Vec<Buffer> = Vec::with_capacity(overlay_lines.len());
         for line in overlay_lines {
-            let mut buf = Buffer::new(&mut self.font_system, metrics);
-            buf.set_size(Some(width as f32), Some(metrics.line_height));
+            let mut buf = grid_text_buffer(&mut self.font_system, metrics, width as f32);
             let spans: Vec<(&str, Attrs)> = line
                 .spans
                 .iter()
@@ -578,7 +630,7 @@ impl Renderer {
                 })
                 .collect();
             buf.set_rich_text(spans, &default_attrs, Shaping::Basic, Some(Align::Left));
-            buf.shape_until_scroll(&mut self.font_system, false);
+            align_to_cell_grid(&mut buf, &mut self.font_system, self.cell_w);
             overlay_bufs.push(buf);
         }
 
@@ -630,6 +682,35 @@ impl Renderer {
             &mut self.swash,
         )?;
 
+        if overlay_count > 0 {
+            let overlay_areas: Vec<TextArea> = overlay_lines.iter().zip(&overlay_bufs).map(|(line, buf)| {
+                TextArea {
+                    buffer: buf,
+                    left: line.left,
+                    top: line.top,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: width as i32,
+                        bottom: (line.top + metrics.line_height) as i32,
+                    },
+                    default_color: GColor::rgb(200, 200, 200),
+                    custom_glyphs: &[],
+                }
+            }).collect();
+
+            self.overlay_text_renderer.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                overlay_areas.into_iter(),
+                &mut self.swash,
+            )?;
+        }
+
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
@@ -676,33 +757,6 @@ impl Renderer {
         }
 
         if overlay_count > 0 {
-            let overlay_areas: Vec<TextArea> = overlay_lines.iter().zip(&overlay_bufs).map(|(line, buf)| {
-                TextArea {
-                    buffer: buf,
-                    left: line.left,
-                    top: line.top,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: width as i32,
-                        bottom: (line.top + metrics.line_height) as i32,
-                    },
-                    default_color: GColor::rgb(200, 200, 200),
-                    custom_glyphs: &[],
-                }
-            }).collect();
-
-            self.text_renderer.prepare(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                overlay_areas.into_iter(),
-                &mut self.swash,
-            )?;
-
             {
                 let inst_size = std::mem::size_of::<Instance>() as u64;
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -727,12 +781,53 @@ impl Renderer {
                 pass.set_vertex_buffer(1, self.bg_instances.slice((bg_count as u64) * inst_size..));
                 pass.draw(0..4, 0..overlay_count as u32);
 
-                self.text_renderer.render(&self.atlas, &self.viewport, &mut pass)?;
+                self.overlay_text_renderer.render(&self.atlas, &self.viewport, &mut pass)?;
             }
         }
 
         self.queue.submit([encoder.finish()]);
         self.atlas.trim();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_fullwidth_and_styled_text_matches_cell_columns() {
+        let mut fonts = FontSystem::new();
+        let mut buffer = grid_text_buffer(&mut fonts, Metrics::new(14.0, 18.0), 64.0);
+        let attrs = Attrs::new().family(Family::Monospace);
+        let accent = GColor::rgb(80, 160, 240);
+        buffer.set_rich_text(
+            vec![("A日", attrs.clone()), ("B本X", attrs.clone().weight(Weight::BOLD).color(accent))],
+            &attrs,
+            Shaping::Basic,
+            Some(Align::Left),
+        );
+        align_to_cell_grid(&mut buffer, &mut fonts, 8.0);
+        let run = buffer.layout_runs().next().unwrap();
+        for glyph in run.glyphs {
+            let column = run.text[..glyph.start].width();
+            assert!((glyph.x - column as f32 * 8.0).abs() < 0.05, "start={} x={} column={column}", glyph.start, glyph.x);
+            if run.text[glyph.start..glyph.end].contains('B') {
+                assert_eq!(glyph.color_opt, Some(accent));
+            }
+        }
+    }
+
+    #[test]
+    fn text_advances_match_the_background_cell_grid() {
+        let mut fonts = FontSystem::new();
+        let mut buffer = grid_text_buffer(&mut fonts, Metrics::new(14.0, 18.0), 32.0);
+        buffer.set_text("AAAAAAAAAAMX", &Attrs::new().family(Family::Monospace), Shaping::Basic, None);
+        align_to_cell_grid(&mut buffer, &mut fonts, 8.0);
+        let run = buffer.layout_runs().next().unwrap();
+        assert_eq!(run.glyphs.len(), 12);
+        for glyph in run.glyphs {
+            assert!((glyph.x - glyph.start as f32 * 8.0).abs() < 0.05, "start={} x={} w={} size={}", glyph.start, glyph.x, glyph.w, glyph.font_size);
+        }
     }
 }
