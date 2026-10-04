@@ -3,6 +3,8 @@
 GPU terminal emulator with input/output visual effects, written in Rust
 (wgpu + glyphon + alacritty_terminal).
 
+![dopaterm demo](docs/demo.gif)
+
 ## Features
 
 - Visual effects driven by input/output events: shatter on erase, cursor
