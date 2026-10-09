@@ -3,8 +3,8 @@
 mod app;
 mod colors;
 mod config;
-mod fx;
 mod fonts;
+mod fx;
 mod ime;
 mod input;
 mod mouse;
@@ -98,8 +98,8 @@ mod win_console {
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Console::{
-        AllocConsole, AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS,
-        STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, GetStdHandle, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
     };
 
     fn open_device(name: &str, access: u32) -> HANDLE {

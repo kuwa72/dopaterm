@@ -61,8 +61,11 @@ impl Particle {
         let t = (self.life / self.max_life).clamp(0.0, 1.0);
         let mut c = self.color;
         c[3] *= t;
-        let rot =
-            if self.spin { self.vy.atan2(self.vx) } else { 0.0 };
+        let rot = if self.spin {
+            self.vy.atan2(self.vx)
+        } else {
+            0.0
+        };
         Instance {
             pos: [self.x, self.y],
             size: [self.size, self.size],
@@ -79,12 +82,31 @@ impl Particle {
 pub enum FxEvent {
     /// A printable key (or other key) was sent to the PTY. `x,y` is the cursor
     /// cell center at the moment of input. `ch` is the first typed character, if any.
-    Key { kind: KeyKind, ch: Option<char>, x: f32, y: f32 },
+    Key {
+        kind: KeyKind,
+        ch: Option<char>,
+        x: f32,
+        y: f32,
+    },
     /// A cell that previously held `ch` was erased (cleared or overwritten by
     /// space). `x,y,w,h` is the cell rect.
-    Erased { ch: char, x: f32, y: f32, w: f32, h: f32, color: [f32; 4] },
+    Erased {
+        ch: char,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: [f32; 4],
+    },
     /// Cursor jumped. `dx,dy` is pixel delta direction.
-    CursorMoved { x: f32, y: f32, w: f32, h: f32, dx: f32, dy: f32 },
+    CursorMoved {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        dx: f32,
+        dy: f32,
+    },
     /// `n` units of PTY output were consumed this frame; `w,h` is the window
     /// size in pixels so effects can rain across the full screen.
     PtyOutput { n: usize, w: f32, h: f32 },
@@ -101,7 +123,13 @@ pub enum FxEvent {
     Confetti { x: f32, y: f32, w: f32, h: f32 },
     /// Child/grandchild process exited with a non-zero status. `x,y` is the
     /// window center; `w,h` is the window size; `status` is the exit code.
-    ChildError { x: f32, y: f32, w: f32, h: f32, status: i32 },
+    ChildError {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        status: i32,
+    },
 }
 
 /// Effect plugin interface. `scale` is the global intensity multiplier.
@@ -145,7 +173,11 @@ pub struct Manager {
 
 impl Manager {
     pub fn new(scale: f32) -> Self {
-        Self { effects: Vec::new(), scale, scratch: Vec::new() }
+        Self {
+            effects: Vec::new(),
+            scale,
+            scratch: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, e: Box<dyn Effect>) {

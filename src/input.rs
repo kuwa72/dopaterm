@@ -26,7 +26,11 @@ pub fn decode_key(ev: &KeyEvent, mods: ModifiersState, app_cursor: bool) -> Opti
     let shift = mods.shift_key();
 
     let named = |bytes: &'static [u8], kind: KeyKind, ch: Option<char>| {
-        Some(DecodedKey { bytes: bytes.to_vec(), kind, ch })
+        Some(DecodedKey {
+            bytes: bytes.to_vec(),
+            kind,
+            ch,
+        })
     };
 
     let arrows = |n3: &'static [u8], ss3: &'static [u8]| if app_cursor { ss3 } else { n3 };
@@ -72,9 +76,7 @@ pub fn decode_key(ev: &KeyEvent, mods: ModifiersState, app_cursor: bool) -> Opti
                         let ch = ch.to_ascii_lowercase();
                         match ch {
                             'a'..='z' => out.push(ch as u8 - b'a' + 1),
-                            '[' | '\\' | ']' | '^' | '_' => {
-                                out.push(ch as u8 - b'[' + 0x1b)
-                            }
+                            '[' | '\\' | ']' | '^' | '_' => out.push(ch as u8 - b'[' + 0x1b),
                             ' ' | '2' | '@' => out.push(0),
                             '3'..='7' => out.push(ch as u8 - b'3' + 0x1b),
                             '8' | '?' => out.push(0x7f),
@@ -82,7 +84,11 @@ pub fn decode_key(ev: &KeyEvent, mods: ModifiersState, app_cursor: bool) -> Opti
                         }
                     }
                     if !out.is_empty() {
-                        return Some(DecodedKey { bytes: out, kind: KeyKind::Other, ch: None });
+                        return Some(DecodedKey {
+                            bytes: out,
+                            kind: KeyKind::Other,
+                            ch: None,
+                        });
                     }
                 }
                 return None;

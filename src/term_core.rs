@@ -4,13 +4,13 @@ use std::borrow::Cow;
 use std::io;
 use std::sync::Arc;
 
+use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::tty;
-use alacritty_terminal::Term;
 use winit::event_loop::EventLoopProxy;
 
 /// Messages delivered to the winit event loop.
@@ -84,15 +84,25 @@ impl TermCore {
             let pty = tty::new(&options, window_size, 0)?;
             (pty, None)
         };
-        let dims = Dims { cols: window_size.num_cols as usize, lines: window_size.num_lines as usize };
+        let dims = Dims {
+            cols: window_size.num_cols as usize,
+            lines: window_size.num_lines as usize,
+        };
 
-        let term_config = TermConfig { scrolling_history: 10_000, ..Default::default() };
+        let term_config = TermConfig {
+            scrolling_history: 10_000,
+            ..Default::default()
+        };
         let term = Arc::new(FairMutex::new(Term::new(term_config, &dims, proxy.clone())));
 
         let event_loop = EventLoop::new(Arc::clone(&term), proxy, pty, true, false)?;
         let sender = event_loop.channel();
         let _handle = event_loop.spawn();
-        Ok(Self { term, sender, child_pid })
+        Ok(Self {
+            term,
+            sender,
+            child_pid,
+        })
     }
 
     pub fn write(&self, bytes: &[u8]) {

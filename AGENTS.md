@@ -10,7 +10,8 @@ GPU terminal emulator with input/output visual effects (dopairb-inspired), in Ru
 - Erase detection for shatter is a per-frame grid diff (`App::build_frame` snapshot vs. current); mass changes (>1/3 of grid) are treated as scroll/redraw and suppress shatter. Backspace/Delete additionally fire a predictive erase read from the grid at key-press time (deduped ~200ms).
 - CommandDone/Waiting are heuristics driven by a 200ms `UserEvent::Wake` heartbeat: Enter (non-alt-screen) -> output -> 600ms quiet = done; >3s idle = waiting pulse every 1.5s.
 - Text is cached per screen row: only rows with cell/cursor changes are re-shaped (glyphon `line_bufs`), so particle animation does not re-layout the whole grid.
-- Screenshot mode `--screenshot FILE` renders offscreen + PNG readback; used for headless verification.
+- Rows are shaped with `Shaping::Advanced` (font fallback + grapheme clustering); `Shaping::Basic` has no fallback and renders emoji/CJK/symbols absent from the primary font as blank. `SnapCell` carries `cell.zerowidth()` (VS16, ZWJ, combining marks) so clusters shape correctly.
+- Screenshot mode `--screenshot FILE` renders offscreen + PNG readback; used for headless verification. `DOPA_FEED=<bytes>` injects raw bytes (incl. escapes) into the grid before capture, independent of the shell.
 
 ## Build
 
@@ -48,7 +49,9 @@ XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir ./target/debug/dopaterm --screenshot /tmp/
 ## Font selection / overlay verification
 
 - The F1 font selector uses the renderer's system font database (`glyphon::FontSystem` / `fontdb`), filtering `FaceInfo::monospaced`, sorting and deduplicating family names. The catalog is collected once at startup; configured unavailable/proportional fonts fall back to an installed monospace preference.
-- Run `bash scripts/test-fonts-windows.sh` to verify Linux/Windows tests, actual Windows font enumeration, mouse regressions, and a settings screenshot. `DOPA_SETTINGS_DEMO=1` displays settings only in screenshot mode.
+- The `[list]` button opens a picker page (app state `settings_fonts` = scroll offset) that renders each family in its own typeface via `Line.family`, scrolls with the wheel, applies on click, and exits via `[back]`/Esc.
+- Run `bash scripts/test-fonts-windows.sh` to verify Linux/Windows tests, actual Windows font enumeration, mouse regressions, and a settings screenshot. `DOPA_SETTINGS_DEMO=1` / `DOPA_FONTLIST_DEMO=1` display the settings main page / font picker only in screenshot mode.
+- Configured `font_size` is points: the renderer multiplies it by `window.scale_factor()` and re-measures on `ScaleFactorChanged`. `--screenshot` pins the scale to 1.0 so pixel-based verification is DPI-independent.
 - Terminal and overlay text need separate glyphon `TextRenderer`s, both prepared before encoding render passes. Reusing one renderer before queue submission overwrites its vertex data and can destroy a buffer referenced by the terminal pass.
 
 ## New UI / input
