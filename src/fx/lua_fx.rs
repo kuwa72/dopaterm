@@ -49,9 +49,16 @@ impl LuaEffect {
             .globals()
             .get::<Option<String>>("fx_name")?
             .unwrap_or_else(|| {
-                path.file_stem().unwrap_or_default().to_string_lossy().into_owned()
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
             });
-        Ok(Self { lua, name, parts: Parts::default() })
+        Ok(Self {
+            lua,
+            name,
+            parts: Parts::default(),
+        })
     }
 
     fn drain_queue(&mut self, scale: f32) {
@@ -70,7 +77,12 @@ impl LuaEffect {
                 life: life * scale.max(0.05),
                 max_life: life * scale.max(0.05),
                 size: g("size").max(1.0),
-                color: [g("r"), g("g"), g("b"), if g("a") == 0.0 { 1.0 } else { g("a") }],
+                color: [
+                    g("r"),
+                    g("g"),
+                    g("b"),
+                    if g("a") == 0.0 { 1.0 } else { g("a") },
+                ],
                 kind: g("kind") as u32,
                 drag: g("drag"),
                 spin: g("spin") != 0.0,
@@ -87,7 +99,9 @@ impl Effect for LuaEffect {
 
     fn on_event(&mut self, ev: &FxEvent, scale: f32) {
         let g = self.lua.globals();
-        let Ok(f) = g.get::<Option<Function>>("on_event") else { return };
+        let Ok(f) = g.get::<Option<Function>>("on_event") else {
+            return;
+        };
         let Some(f) = f else { return };
         if let Ok(e) = self.event_table(ev) {
             let _ = f.call::<()>(e);
@@ -118,18 +132,28 @@ impl LuaEffect {
         match ev {
             FxEvent::Key { kind, ch, x, y } => {
                 t.set("type", "key")?;
-                t.set("kind", match kind {
-                    KeyKind::Char => "char",
-                    KeyKind::Backspace => "backspace",
-                    KeyKind::Enter => "enter",
-                    KeyKind::Arrow => "arrow",
-                    KeyKind::Other => "other",
-                })?;
+                t.set(
+                    "kind",
+                    match kind {
+                        KeyKind::Char => "char",
+                        KeyKind::Backspace => "backspace",
+                        KeyKind::Enter => "enter",
+                        KeyKind::Arrow => "arrow",
+                        KeyKind::Other => "other",
+                    },
+                )?;
                 t.set("ch", ch.map(|c| c.to_string()).unwrap_or_default())?;
                 t.set("x", *x)?;
                 t.set("y", *y)?;
             }
-            FxEvent::Erased { ch, x, y, w, h, color } => {
+            FxEvent::Erased {
+                ch,
+                x,
+                y,
+                w,
+                h,
+                color,
+            } => {
                 t.set("type", "erased")?;
                 t.set("ch", ch.to_string())?;
                 t.set("x", *x)?;

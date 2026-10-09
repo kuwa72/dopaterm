@@ -107,6 +107,7 @@ impl Preedit {
                 fg,
                 bold: false,
             }],
+            family: None,
         }];
         (quads, lines)
     }

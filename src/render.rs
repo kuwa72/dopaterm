@@ -1,14 +1,14 @@
 //! GPU renderer: cell background quads -> glyphon text -> effect quads.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use glyphon::cosmic_text::{Align, Attrs, AttrsOwned, Family, Metrics, Shaping, Weight, Wrap};
-use unicode_width::UnicodeWidthStr;
 use glyphon::{
     Buffer, Cache, Color as GColor, FontSystem, Resolution, SwashCache, TextArea, TextAtlas,
     TextBounds, TextRenderer, Viewport,
 };
+use unicode_width::UnicodeWidthStr;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -115,6 +115,9 @@ pub struct Line {
     pub top: f32,
     pub left: f32,
     pub spans: Vec<Span>,
+    /// Per-line family override; used by the font picker to render each
+    /// family name in its own typeface.
+    pub family: Option<String>,
 }
 
 pub struct Renderer {
@@ -143,7 +146,10 @@ pub struct Renderer {
     overlay_text_renderer: TextRenderer,
     pub cell_w: f32,
     pub cell_h: f32,
+    /// Configured size in points; multiplied by `scale_factor` to get
+    /// physical pixels on HiDPI displays.
     font_size: f32,
+    scale_factor: f32,
     font_family: Option<String>,
     font_families: Vec<String>,
 }
@@ -161,7 +167,10 @@ fn align_to_cell_grid(buffer: &mut Buffer, font_system: &mut FontSystem, cell_w:
     buffer.shape_until_scroll(font_system, false);
     let mut changed = false;
     for line in &mut buffer.lines {
-        let adjustments: Vec<_> = line.layout_opt().into_iter().flatten()
+        let adjustments: Vec<_> = line
+            .layout_opt()
+            .into_iter()
+            .flatten()
             .flat_map(|layout| &layout.glyphs)
             .filter_map(|glyph| {
                 let width = line.text()[glyph.start..glyph.end].width() as f32 * cell_w;
@@ -169,9 +178,13 @@ fn align_to_cell_grid(buffer: &mut Buffer, font_system: &mut FontSystem, cell_w:
                 if spacing.abs() < 0.0001 {
                     return None;
                 }
-                let attrs = line.attrs_list().get_span(glyph.start).letter_spacing(spacing);
+                let attrs = line
+                    .attrs_list()
+                    .get_span(glyph.start)
+                    .letter_spacing(spacing);
                 Some((glyph.start..glyph.end, AttrsOwned::new(&attrs)))
-            }).collect();
+            })
+            .collect();
         if adjustments.is_empty() {
             continue;
         }
@@ -195,8 +208,13 @@ pub enum FrameOutcome {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, font_size: f32, font_family: Option<String>) -> anyhow::Result<Self> {
+    pub async fn new(
+        window: Arc<Window>,
+        font_size: f32,
+        font_family: Option<String>,
+    ) -> anyhow::Result<Self> {
         let size = window.inner_size();
+        let scale_factor = window.scale_factor() as f32;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window)?;
         // An adapter can be reported lost mid-enumeration when the GPU
@@ -223,7 +241,10 @@ impl Renderer {
                         continue;
                     }
                 };
-                match adapter.request_device(&wgpu::DeviceDescriptor::default()).await {
+                match adapter
+                    .request_device(&wgpu::DeviceDescriptor::default())
+                    .await
+                {
                     Ok((d, q)) => {
                         result = Some((adapter, d, q));
                         break;
@@ -292,12 +313,7 @@ impl Renderer {
         });
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
-            contents: bytemuck::cast_slice(&[
-                size.width as f32,
-                size.height as f32,
-                0.0,
-                0.0,
-            ]),
+            contents: bytemuck::cast_slice(&[size.width as f32, size.height as f32, 0.0, 0.0]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -426,6 +442,7 @@ impl Renderer {
             cell_w: 8.0,
             cell_h: 16.0,
             font_size,
+            scale_factor,
             font_family,
             font_families,
         };
@@ -433,8 +450,14 @@ impl Renderer {
         Ok(r)
     }
 
+    /// Text metrics in physical pixels: configured points x DPI scale.
+    fn text_metrics(&self) -> Metrics {
+        let px = self.font_size * self.scale_factor;
+        Metrics::new(px, px * 1.25)
+    }
+
     fn measure_cell(&mut self) {
-        let metrics = Metrics::new(self.font_size, self.font_size * 1.25);
+        let metrics = self.text_metrics();
         let fname = self.font_family.clone();
         let family = match fname.as_deref() {
             Some(n) => Family::Name(n),
@@ -442,7 +465,12 @@ impl Renderer {
         };
         let mut buf = Buffer::new(&mut self.font_system, metrics);
         buf.set_size(Some(1000.0), Some(metrics.line_height));
-        buf.set_text("MMMMMMMMMM", &Attrs::new().family(family), Shaping::Basic, None);
+        buf.set_text(
+            "MMMMMMMMMM",
+            &Attrs::new().family(family),
+            Shaping::Basic,
+            None,
+        );
         buf.shape_until_scroll(&mut self.font_system, false);
         let w = buf
             .layout_runs()
@@ -468,6 +496,18 @@ impl Renderer {
     pub fn set_font(&mut self, size: f32, family: Option<&str>) {
         self.font_size = size.max(4.0);
         self.font_family = crate::fonts::resolve_family(family, &self.font_families);
+        self.line_bufs.clear();
+        self.measure_cell();
+    }
+
+    /// Update the DPI scale (window moved between monitors); re-measures
+    /// the cell grid so text stays the same logical size.
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        let sf = (scale_factor as f32).max(0.1);
+        if (sf - self.scale_factor).abs() < 0.01 {
+            return;
+        }
+        self.scale_factor = sf;
         self.line_bufs.clear();
         self.measure_cell();
     }
@@ -520,7 +560,18 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&Default::default());
         let (w, h) = (self.surface_config.width, self.surface_config.height);
-        self.draw(&view, w, h, clear, bg, lines, dirty, fx, overlay_bg, overlay_lines)?;
+        self.draw(
+            &view,
+            w,
+            h,
+            clear,
+            bg,
+            lines,
+            dirty,
+            fx,
+            overlay_bg,
+            overlay_lines,
+        )?;
         self.queue.present(frame);
         // A faulted device never recovers: keep the flag set so every
         // subsequent frame bails too (a stale surface may keep reporting
@@ -546,7 +597,11 @@ impl Renderer {
         let format = self.surface_config.format;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -581,7 +636,9 @@ impl Renderer {
         });
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("shot"),
+            });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &tex,
@@ -597,7 +654,11 @@ impl Renderer {
                     rows_per_image: None,
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         self.queue.submit([encoder.finish()]);
         let slice = out.slice(..);
@@ -651,7 +712,7 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&[width as f32, height as f32, 0.0, 0.0]),
         );
-        let metrics = Metrics::new(self.font_size, self.font_size * 1.25);
+        let metrics = self.text_metrics();
         let fname = self.font_family.clone();
         let family = match fname.as_deref() {
             Some(n) => Family::Name(n),
@@ -681,7 +742,10 @@ impl Renderer {
                             (s.text.as_str(), a)
                         })
                         .collect();
-                    buf.set_rich_text(spans, &default_attrs, Shaping::Basic, Some(Align::Left));
+                    // Advanced shaping is required for font fallback:
+                    // Basic never leaves the requested family, so glyphs
+                    // missing from it (emoji, CJK, symbols) render blank.
+                    buf.set_rich_text(spans, &default_attrs, Shaping::Advanced, Some(Align::Left));
                     align_to_cell_grid(&mut buf, &mut self.font_system, self.cell_w);
                     self.line_bufs[i] = Some(buf);
                 }
@@ -693,13 +757,17 @@ impl Renderer {
         // Build overlay text buffers fresh each frame.
         let mut overlay_bufs: Vec<Buffer> = Vec::with_capacity(overlay_lines.len());
         for line in overlay_lines {
+            let line_family = match line.family.as_deref() {
+                Some(n) => Family::Name(n),
+                None => family,
+            };
             let mut buf = grid_text_buffer(&mut self.font_system, metrics, width as f32);
             let spans: Vec<(&str, Attrs)> = line
                 .spans
                 .iter()
                 .map(|s| {
                     let mut a = Attrs::new()
-                        .family(family)
+                        .family(line_family)
                         .color(GColor::rgba(s.fg[0], s.fg[1], s.fg[2], s.fg[3]));
                     if s.bold {
                         a = a.weight(Weight::BOLD);
@@ -707,7 +775,8 @@ impl Renderer {
                     (s.text.as_str(), a)
                 })
                 .collect();
-            buf.set_rich_text(spans, &default_attrs, Shaping::Basic, Some(Align::Left));
+            let line_attrs = Attrs::new().family(line_family);
+            buf.set_rich_text(spans, &line_attrs, Shaping::Advanced, Some(Align::Left));
             align_to_cell_grid(&mut buf, &mut self.font_system, self.cell_w);
             overlay_bufs.push(buf);
         }
@@ -716,37 +785,51 @@ impl Renderer {
         let lin = |list: &[Instance]| -> Vec<Instance> {
             list.iter()
                 .take(self.inst_capacity)
-                .map(|i| Instance { color: crate::colors::srgb_to_linear(i.color), ..*i })
+                .map(|i| Instance {
+                    color: crate::colors::srgb_to_linear(i.color),
+                    ..*i
+                })
                 .collect()
         };
         let bg_lin = lin(bg);
         let overlay_bg_lin = lin(overlay_bg);
         let fx_lin = lin(fx);
-        let bg_all: Vec<Instance> = bg_lin.iter().chain(overlay_bg_lin.iter()).copied().collect();
+        let bg_all: Vec<Instance> = bg_lin
+            .iter()
+            .chain(overlay_bg_lin.iter())
+            .copied()
+            .collect();
         let bg_count = bg_lin.len();
         let overlay_count = overlay_bg_lin.len();
-        self.queue.write_buffer(&self.bg_instances, 0, bytemuck::cast_slice(&bg_all));
-        self.queue.write_buffer(&self.fx_instances, 0, bytemuck::cast_slice(&fx_lin));
+        self.queue
+            .write_buffer(&self.bg_instances, 0, bytemuck::cast_slice(&bg_all));
+        self.queue
+            .write_buffer(&self.fx_instances, 0, bytemuck::cast_slice(&fx_lin));
 
-        self.viewport.update(&self.queue, Resolution { width, height });
+        self.viewport
+            .update(&self.queue, Resolution { width, height });
 
-        let terminal_areas: Vec<TextArea> = lines.iter().zip(&self.line_bufs).filter_map(|(line, buf)| {
-            let (line, buf) = line.as_ref().zip(buf.as_ref())?;
-            Some(TextArea {
-                buffer: buf,
-                left: line.left,
-                top: line.top,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: width as i32,
-                    bottom: (line.top + metrics.line_height) as i32,
-                },
-                default_color: GColor::rgb(200, 200, 200),
-                custom_glyphs: &[],
+        let terminal_areas: Vec<TextArea> = lines
+            .iter()
+            .zip(&self.line_bufs)
+            .filter_map(|(line, buf)| {
+                let (line, buf) = line.as_ref().zip(buf.as_ref())?;
+                Some(TextArea {
+                    buffer: buf,
+                    left: line.left,
+                    top: line.top,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: width as i32,
+                        bottom: (line.top + metrics.line_height) as i32,
+                    },
+                    default_color: GColor::rgb(200, 200, 200),
+                    custom_glyphs: &[],
+                })
             })
-        }).collect();
+            .collect();
 
         // Prepare terminal text before starting the render pass so we never
         // update the atlas texture while it is bound for sampling.
@@ -761,8 +844,10 @@ impl Renderer {
         )?;
 
         if overlay_count > 0 {
-            let overlay_areas: Vec<TextArea> = overlay_lines.iter().zip(&overlay_bufs).map(|(line, buf)| {
-                TextArea {
+            let overlay_areas: Vec<TextArea> = overlay_lines
+                .iter()
+                .zip(&overlay_bufs)
+                .map(|(line, buf)| TextArea {
                     buffer: buf,
                     left: line.left,
                     top: line.top,
@@ -775,8 +860,8 @@ impl Renderer {
                     },
                     default_color: GColor::rgb(200, 200, 200),
                     custom_glyphs: &[],
-                }
-            }).collect();
+                })
+                .collect();
 
             self.overlay_text_renderer.prepare(
                 &self.device,
@@ -789,8 +874,11 @@ impl Renderer {
             )?;
         }
 
-        let mut encoder =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("term"),
@@ -822,7 +910,8 @@ impl Renderer {
                 pass.draw(0..4, 0..bg_count as u32);
             }
 
-            self.text_renderer.render(&self.atlas, &self.viewport, &mut pass)?;
+            self.text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass)?;
 
             if !fx_lin.is_empty() {
                 // glyphon's render() clobbered vertex slot 0; restore ours.
@@ -859,7 +948,8 @@ impl Renderer {
                 pass.set_vertex_buffer(1, self.bg_instances.slice((bg_count as u64) * inst_size..));
                 pass.draw(0..4, 0..overlay_count as u32);
 
-                self.overlay_text_renderer.render(&self.atlas, &self.viewport, &mut pass)?;
+                self.overlay_text_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)?;
             }
         }
 
@@ -880,16 +970,24 @@ mod tests {
         let attrs = Attrs::new().family(Family::Monospace);
         let accent = GColor::rgb(80, 160, 240);
         buffer.set_rich_text(
-            vec![("A日", attrs.clone()), ("B本X", attrs.clone().weight(Weight::BOLD).color(accent))],
+            vec![
+                ("A日", attrs.clone()),
+                ("B本X", attrs.clone().weight(Weight::BOLD).color(accent)),
+            ],
             &attrs,
-            Shaping::Basic,
+            Shaping::Advanced,
             Some(Align::Left),
         );
         align_to_cell_grid(&mut buffer, &mut fonts, 8.0);
         let run = buffer.layout_runs().next().unwrap();
         for glyph in run.glyphs {
             let column = run.text[..glyph.start].width();
-            assert!((glyph.x - column as f32 * 8.0).abs() < 0.05, "start={} x={} column={column}", glyph.start, glyph.x);
+            assert!(
+                (glyph.x - column as f32 * 8.0).abs() < 0.05,
+                "start={} x={} column={column}",
+                glyph.start,
+                glyph.x
+            );
             if run.text[glyph.start..glyph.end].contains('B') {
                 assert_eq!(glyph.color_opt, Some(accent));
             }
@@ -900,12 +998,24 @@ mod tests {
     fn text_advances_match_the_background_cell_grid() {
         let mut fonts = FontSystem::new();
         let mut buffer = grid_text_buffer(&mut fonts, Metrics::new(14.0, 18.0), 32.0);
-        buffer.set_text("AAAAAAAAAAMX", &Attrs::new().family(Family::Monospace), Shaping::Basic, None);
+        buffer.set_text(
+            "AAAAAAAAAAMX",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
         align_to_cell_grid(&mut buffer, &mut fonts, 8.0);
         let run = buffer.layout_runs().next().unwrap();
         assert_eq!(run.glyphs.len(), 12);
         for glyph in run.glyphs {
-            assert!((glyph.x - glyph.start as f32 * 8.0).abs() < 0.05, "start={} x={} w={} size={}", glyph.start, glyph.x, glyph.w, glyph.font_size);
+            assert!(
+                (glyph.x - glyph.start as f32 * 8.0).abs() < 0.05,
+                "start={} x={} w={} size={}",
+                glyph.start,
+                glyph.x,
+                glyph.w,
+                glyph.font_size
+            );
         }
     }
 }

@@ -147,7 +147,10 @@ pub fn load(path: Option<PathBuf>) -> Config {
         Ok(text) => match toml::from_str::<Config>(&text) {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("dopaterm: bad config {}: {e}; using defaults", file.display());
+                eprintln!(
+                    "dopaterm: bad config {}: {e}; using defaults",
+                    file.display()
+                );
                 Config::default()
             }
         },
@@ -158,5 +161,9 @@ pub fn load(path: Option<PathBuf>) -> Config {
 pub fn parse_rgb(s: &str) -> [u8; 3] {
     let s = s.trim_start_matches('#');
     let v = u32::from_str_radix(s, 16).unwrap_or(0xc5c8c6);
-    [((v >> 16) & 0xff) as u8, ((v >> 8) & 0xff) as u8, (v & 0xff) as u8]
+    [
+        ((v >> 16) & 0xff) as u8,
+        ((v >> 8) & 0xff) as u8,
+        (v & 0xff) as u8,
+    ]
 }

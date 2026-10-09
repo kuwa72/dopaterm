@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::{Event, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Point};
-use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorShape;
 use winit::application::ApplicationHandler;
@@ -18,9 +18,9 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::colors::{cell_colors, to_f32};
-use crate::config::{self, parse_rgb, Config};
+use crate::config::{self, Config, parse_rgb};
 use crate::fx::{self, FxEvent, Instance, Manager};
-use crate::input::{decode_key, KeyKind};
+use crate::input::{KeyKind, decode_key};
 use crate::render::{FrameOutcome, Line, Renderer, Span};
 use crate::settings_ui;
 use crate::term_core::{EventProxy, TermCore, UserEvent};
@@ -33,8 +33,8 @@ pub struct App {
     term: Option<TermCore>,
     fx: Manager,
     mods: ModifiersState,
-    /// Previous frame's cells: (char, fg, bg, bold), indexed line*cols+col.
-    snapshot: Vec<(char, [u8; 4], [u8; 4], bool)>,
+    /// Previous frame's cells, indexed line*cols+col.
+    snapshot: Vec<SnapCell>,
     /// Cached styled lines for the renderer; rebuilt per dirty row.
     lines: Vec<Option<Line>>,
     /// Rows whose text needs re-shaping this frame.
@@ -97,6 +97,9 @@ pub struct App {
     ime_preedit: crate::ime::Preedit,
     /// Settings overlay state.
     show_settings: bool,
+    /// Font picker page state: `Some` = first visible index into the
+    /// renderer's monospace family catalog.
+    settings_fonts: Option<usize>,
     mouse_demo_done: bool,
     /// Active hitboxes in the settings overlay for the current frame.
     settings_hits: Vec<crate::settings_ui::Hit>,
@@ -148,6 +151,7 @@ impl App {
             ime_composing: false,
             ime_preedit: crate::ime::Preedit::default(),
             show_settings: false,
+            settings_fonts: None,
             mouse_demo_done: false,
             settings_hits: Vec::new(),
         }
@@ -163,7 +167,15 @@ impl App {
     fn build_settings_overlay(&self) -> (Vec<Instance>, Vec<Line>, Vec<settings_ui::Hit>) {
         let r = self.renderer.as_ref().unwrap();
         let w = self.window.as_ref().unwrap().inner_size();
-        settings_ui::build(&self.cfg, w.width as f32, w.height as f32, r.cell_w, r.cell_h, r.font_families())
+        settings_ui::build(
+            &self.cfg,
+            w.width as f32,
+            w.height as f32,
+            r.cell_w,
+            r.cell_h,
+            r.font_families(),
+            self.settings_fonts,
+        )
     }
 
     fn build_overlay(&self) -> (Vec<Instance>, Vec<Line>, Vec<settings_ui::Hit>) {
@@ -172,7 +184,10 @@ impl App {
         }
         let r = self.renderer.as_ref().unwrap();
         let size = self.window.as_ref().unwrap().inner_size();
-        let anchor = (self.last_cursor_px.0 - r.cell_w / 2.0, self.last_cursor_px.1 - r.cell_h / 2.0);
+        let anchor = (
+            self.last_cursor_px.0 - r.cell_w / 2.0,
+            self.last_cursor_px.1 - r.cell_h / 2.0,
+        );
         let (quads, lines) = self.ime_preedit.overlay(
             anchor,
             (r.cell_w, r.cell_h),
@@ -221,7 +236,9 @@ impl App {
     /// nothing. Recreate the whole window; the PTY/shell keeps running
     /// because TermCore is independent of the renderer.
     fn recreate_window_and_renderer(&mut self, el: &ActiveEventLoop) {
-        let Some(old_win) = self.window.take() else { return };
+        let Some(old_win) = self.window.take() else {
+            return;
+        };
         let size = old_win.inner_size();
         let pos = old_win.outer_position().ok();
         // Hide the old window first: its leaked surface holds an
@@ -261,7 +278,9 @@ impl App {
     /// after the GPU configuration changed underneath us, keeping the
     /// same window.
     fn recreate_renderer(&mut self) {
-        let Some(window) = self.window.clone() else { return };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
         let size = window.inner_size();
         // Drop the old renderer BEFORE creating the new surface. Its drop
         // panics inside wgpu-hal on a lost device (unreleased acquire
@@ -281,6 +300,9 @@ impl App {
         }));
         match result {
             Ok(Ok(mut r)) => {
+                if self.shot_path.is_some() {
+                    r.set_scale_factor(1.0);
+                }
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     r.resize(size.width, size.height)
                 }));
@@ -299,7 +321,9 @@ impl App {
     }
 
     fn resize_terminal_to_window(&mut self) {
-        let Some(r) = self.renderer.as_ref() else { return };
+        let Some(r) = self.renderer.as_ref() else {
+            return;
+        };
         let Some(term) = &self.term else { return };
         let size = self.window.as_ref().unwrap().inner_size();
         let ws = alacritty_terminal::event::WindowSize {
@@ -346,7 +370,11 @@ impl App {
         if self.cfg.effects.process_error {
             self.fx.push(Box::new(fx::builtin::ProcessError::new()));
         }
-        let lua_dir = self.cfg.effects.lua_dir.clone()
+        let lua_dir = self
+            .cfg
+            .effects
+            .lua_dir
+            .clone()
             .unwrap_or_else(|| config::config_dir().join("effects"));
         if let Ok(dir) = std::fs::read_dir(&lua_dir) {
             for entry in dir.flatten() {
@@ -365,7 +393,9 @@ impl App {
         let mode = *term.term.lock().mode();
         #[cfg(windows)]
         if !crate::mouse::tracking_enabled(mode)
-            && term.child_pid.and_then(crate::mouse_inject::input_mode)
+            && term
+                .child_pid
+                .and_then(crate::mouse_inject::input_mode)
                 .is_some_and(crate::mouse_inject::native_tracking_enabled)
         {
             return mode | TermMode::MOUSE_MOTION;
@@ -373,7 +403,14 @@ impl App {
         mode
     }
 
-    fn send_mouse_event(&self, term: &TermCore, button: u8, col: usize, line: usize, release: bool) {
+    fn send_mouse_event(
+        &self,
+        term: &TermCore,
+        button: u8,
+        col: usize,
+        line: usize,
+        release: bool,
+    ) {
         let mode = self.mouse_mode(term);
         let Some(seq) = crate::mouse::encode(
             &mode,
@@ -394,7 +431,10 @@ impl App {
                 .append(true)
                 .open("/tmp/dopaterm_mouse.log")
             {
-                let _ = writeln!(f, "btn={button} col={col} line={line} release={release} seq={seq:?}");
+                let _ = writeln!(
+                    f,
+                    "btn={button} col={col} line={line} release={release} seq={seq:?}"
+                );
             }
         }
 
@@ -428,7 +468,11 @@ impl App {
                         2 => RIGHTMOST_BUTTON_PRESSED,
                         _ => 0,
                     };
-                    let flags = if is_motion { crate::mouse_inject::MOUSE_MOVED } else { 0 };
+                    let flags = if is_motion {
+                        crate::mouse_inject::MOUSE_MOVED
+                    } else {
+                        0
+                    };
                     (state, flags)
                 };
                 let mut ctrl = 0u32;
@@ -442,7 +486,12 @@ impl App {
                     ctrl |= crate::mouse_inject::LEFT_ALT_PRESSED;
                 }
                 if !crate::mouse_inject::send_mouse_event(
-                    pid, col as i16, line as i16, button_state, ctrl, event_flags,
+                    pid,
+                    col as i16,
+                    line as i16,
+                    button_state,
+                    ctrl,
+                    event_flags,
                 ) {
                     eprintln!("dopaterm: native mouse injection failed pid={pid}");
                 }
@@ -474,7 +523,9 @@ impl App {
             return;
         }
         let cols = self.snapshot.len() / rows;
-        let Some(term) = self.term.as_ref() else { return };
+        let Some(term) = self.term.as_ref() else {
+            return;
+        };
         let offset = term.term.lock().grid().display_offset();
         let text = selected_text(&self.snapshot, cols, rows, offset, &sel);
         if !text.is_empty() {
@@ -487,7 +538,9 @@ impl App {
     /// Paste clipboard content: an image becomes a PNG temp file whose path
     /// is pasted (for CLI agents), otherwise text is pasted.
     fn paste_clipboard(&self, term: &TermCore) {
-        let Ok(mut cb) = arboard::Clipboard::new() else { return };
+        let Ok(mut cb) = arboard::Clipboard::new() else {
+            return;
+        };
         if let Ok(img) = cb.get_image() {
             if let Some(path) = save_clipboard_image(&img) {
                 #[cfg(windows)]
@@ -523,7 +576,9 @@ impl App {
             return;
         }
         self.mouse_demo_done = true;
-        let Some(term) = self.term.as_ref() else { return };
+        let Some(term) = self.term.as_ref() else {
+            return;
+        };
         // Move to a known cell and generate press / release / wheel events.
         self.mouse_cell = (4, 2);
         self.send_mouse_event(term, 0, self.mouse_cell.0, self.mouse_cell.1, false);
@@ -532,6 +587,20 @@ impl App {
         self.send_mouse_event(term, 64, self.mouse_cell.0, self.mouse_cell.1, false);
         eprintln!("dopaterm: synthetic mouse events injected; exiting in 500ms");
         self.pending_exit = Some(Instant::now() + Duration::from_millis(500));
+    }
+
+    /// Open the font picker page, scrolled so the active family is visible.
+    fn open_font_list(&mut self) {
+        let fonts = self.renderer.as_ref().unwrap().font_families();
+        let current = crate::fonts::resolve_family(self.cfg.font_family.as_deref(), fonts)
+            .and_then(|f| fonts.iter().position(|x| x == &f))
+            .unwrap_or(0);
+        let max = fonts.len().saturating_sub(settings_ui::FONT_LIST_ROWS);
+        self.settings_fonts = Some(
+            current
+                .saturating_sub(settings_ui::FONT_LIST_ROWS / 2)
+                .min(max),
+        );
     }
 
     fn handle_settings_click(&mut self) {
@@ -545,19 +614,35 @@ impl App {
                     settings_ui::Action::Close => {
                         self.show_settings = false;
                     }
-                    settings_ui::Action::Intensity(_) |
-                    settings_ui::Action::Toggle(_) => {
-                        settings_ui::apply_action(&mut self.cfg, &hit.action, self.renderer.as_ref().unwrap().font_families());
+                    settings_ui::Action::Intensity(_) | settings_ui::Action::Toggle(_) => {
+                        settings_ui::apply_action(
+                            &mut self.cfg,
+                            &hit.action,
+                            self.renderer.as_ref().unwrap().font_families(),
+                        );
                         needs_effects = true;
                     }
-                    settings_ui::Action::FontSize(_) |
-                    settings_ui::Action::FontNext => {
-                        settings_ui::apply_action(&mut self.cfg, &hit.action, self.renderer.as_ref().unwrap().font_families());
+                    settings_ui::Action::FontSize(_)
+                    | settings_ui::Action::FontNext
+                    | settings_ui::Action::FontPrev
+                    | settings_ui::Action::FontSelect(_) => {
+                        settings_ui::apply_action(
+                            &mut self.cfg,
+                            &hit.action,
+                            self.renderer.as_ref().unwrap().font_families(),
+                        );
                         needs_font_reload = true;
                     }
-                    settings_ui::Action::ShellNext |
-                    settings_ui::Action::Theme(_) => {
-                        settings_ui::apply_action(&mut self.cfg, &hit.action, self.renderer.as_ref().unwrap().font_families());
+                    settings_ui::Action::FontList => self.open_font_list(),
+                    settings_ui::Action::FontBack => {
+                        self.settings_fonts = None;
+                    }
+                    settings_ui::Action::ShellNext | settings_ui::Action::Theme(_) => {
+                        settings_ui::apply_action(
+                            &mut self.cfg,
+                            &hit.action,
+                            self.renderer.as_ref().unwrap().font_families(),
+                        );
                     }
                 }
                 if needs_font_reload {
@@ -591,7 +676,9 @@ impl App {
         let Some(term) = &self.term else { return };
         match ev {
             Event::Wakeup => {
-                let (ww, wh) = self.window.as_ref()
+                let (ww, wh) = self
+                    .window
+                    .as_ref()
                     .map(|w| {
                         let s = w.inner_size();
                         (s.width as f32, s.height as f32)
@@ -647,31 +734,43 @@ impl App {
                     term.write(fmt(color).as_bytes());
                 } else {
                     // Respond with default black; full color reporting is a TODO.
-                    term.write(fmt(alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 }).as_bytes());
+                    term.write(
+                        fmt(alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 }).as_bytes(),
+                    );
                 }
             }
             Event::TextAreaSizeRequest(fmt) => {
                 if let Some(r) = &self.renderer {
                     let w = self.window.as_ref().unwrap().inner_size();
-                    term.write(fmt(WindowSize {
-                        num_cols: (w.width as f32 / r.cell_w) as u16,
-                        num_lines: (w.height as f32 / r.cell_h) as u16,
-                        cell_width: r.cell_w as u16,
-                        cell_height: r.cell_h as u16,
-                    }).as_bytes());
+                    term.write(
+                        fmt(WindowSize {
+                            num_cols: (w.width as f32 / r.cell_w) as u16,
+                            num_lines: (w.height as f32 / r.cell_h) as u16,
+                            cell_width: r.cell_w as u16,
+                            cell_height: r.cell_h as u16,
+                        })
+                        .as_bytes(),
+                    );
                 }
             }
             Event::Bell => {
                 let (x, y) = self.last_cursor_px;
                 let r = self.renderer.as_ref().unwrap();
-                self.fx.event(&FxEvent::Bell { x, y, w: r.cell_w, h: r.cell_h });
+                self.fx.event(&FxEvent::Bell {
+                    x,
+                    y,
+                    w: r.cell_w,
+                    h: r.cell_h,
+                });
                 self.dirty = true;
             }
             Event::ChildExit(status) => {
                 if !status.success() {
                     let code = status.code().unwrap_or(1);
                     let (cx, cy) = self.last_cursor_px;
-                    let (ww, wh) = self.window.as_ref()
+                    let (ww, wh) = self
+                        .window
+                        .as_ref()
                         .map(|w| {
                             let s = w.inner_size();
                             (s.width as f32, s.height as f32)
@@ -736,16 +835,23 @@ impl App {
 
         if std::env::var_os("DOPA_DEBUG").is_some() {
             let nonspace = snap.iter().filter(|c| !matches!(c.0, ' ' | '\0')).count();
-            eprintln!("dopaterm: nonspace={} scrolled={} rows={}", nonspace, scrolled, rows);
+            eprintln!(
+                "dopaterm: nonspace={} scrolled={} rows={}",
+                nonspace, scrolled, rows
+            );
         }
 
         // Mass changes = scroll/redraw; suppress shatter storms.
         if !scrolled {
             let erased = find_erased(&self.snapshot, &snap);
             if std::env::var_os("DOPA_DEBUG").is_some() && !erased.is_empty() {
-                eprintln!("dopaterm: erased {:?}", erased.iter().map(|e| e.1).collect::<String>());
+                eprintln!(
+                    "dopaterm: erased {:?}",
+                    erased.iter().map(|e| e.1).collect::<String>()
+                );
             }
-            self.predicted_erase.retain(|(_, at)| at.elapsed() < Duration::from_secs(1));
+            self.predicted_erase
+                .retain(|(_, at)| at.elapsed() < Duration::from_secs(1));
             for (i, ch_, fg_) in erased {
                 // Skip cells already shattered by key-press prediction.
                 if self
@@ -805,29 +911,44 @@ impl App {
             let mut text = String::new();
             let mut span_key: Option<([u8; 4], bool)> = None;
             for col in 0..cols {
-                let (c, mut fg, bg, bold) = snap[i * cols + col];
+                let s = &snap[i * cols + col];
+                let (c, mut fg, bold) = (s.0, s.1, s.3);
                 if c == '\0' {
                     continue;
                 }
                 if p_eq(cursor_point, i, col) && cursor.shape != CursorShape::Hidden {
-                    fg = bg;
+                    fg = s.2;
                 }
                 if span_key != Some((fg, bold)) {
                     if let Some((f, b)) = span_key.take() {
                         if !text.is_empty() {
-                            spans.push(Span { text: std::mem::take(&mut text), fg: f, bold: b });
+                            spans.push(Span {
+                                text: std::mem::take(&mut text),
+                                fg: f,
+                                bold: b,
+                            });
                         }
                     }
                     span_key = Some((fg, bold));
                 }
                 text.push(c);
+                text.extend(s.4.iter().copied());
             }
             if let Some((f, b)) = span_key {
                 if !text.is_empty() {
-                    spans.push(Span { text, fg: f, bold: b });
+                    spans.push(Span {
+                        text,
+                        fg: f,
+                        bold: b,
+                    });
                 }
             }
-            self.lines[i] = Some(Line { top: i as f32 * ch, left: 0.0, spans });
+            self.lines[i] = Some(Line {
+                top: i as f32 * ch,
+                left: 0.0,
+                spans,
+                family: None,
+            });
         }
 
         // Rebuild cell background + cursor quads when content changed.
@@ -835,7 +956,7 @@ impl App {
             self.bgs.clear();
             for i in 0..rows {
                 for col in 0..cols {
-                    let (_, fg, bg, _) = snap[i * cols + col];
+                    let (_, fg, bg, ..) = snap[i * cols + col];
                     let is_cursor = cursor_covers(&snap, cols, cursor_point, i, col)
                         && cursor.shape != CursorShape::Hidden;
                     let qcol = if is_cursor { fg } else { bg };
@@ -884,7 +1005,14 @@ impl App {
                 let (px, py, w, h) = self.cell_rect(prev);
                 let dx = (cursor_point.column.0 as i32 - prev.column.0 as i32) as f32 * cw;
                 let dy = (cursor_point.line.0 - prev.line.0) as f32 * ch;
-                self.fx.event(&FxEvent::CursorMoved { x: px + w / 2.0, y: py + h / 2.0, w, h, dx, dy });
+                self.fx.event(&FxEvent::CursorMoved {
+                    x: px + w / 2.0,
+                    y: py + h / 2.0,
+                    w,
+                    h,
+                    dx,
+                    dy,
+                });
             }
         }
         self.prev_cursor = Some(cursor_point);
@@ -955,7 +1083,10 @@ impl App {
         let default_bg = parse_rgb(&self.cfg.background);
         // Backspace scans left (nearest non-space cell), Delete scans right.
         let cols_to_try: Vec<isize> = if col_offset < 0 {
-            (0..=8).map(|d| base_col - d).take_while(|c| *c >= 0).collect()
+            (0..=8)
+                .map(|d| base_col - d)
+                .take_while(|c| *c >= 0)
+                .collect()
         } else {
             (0..=8).map(|d| base_col + d).collect()
         };
@@ -1023,7 +1154,11 @@ struct Selection {
 
 impl Selection {
     fn ordered(&self) -> ((i32, usize), (i32, usize)) {
-        if self.anchor <= self.head { (self.anchor, self.head) } else { (self.head, self.anchor) }
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
     }
 }
 
@@ -1048,9 +1183,10 @@ fn selected_text(
         let c1 = if buf == el { ec } else { cols - 1 }.min(cols - 1);
         let mut line = String::new();
         for col in c0..=c1 {
-            let (c, ..) = snap[vis * cols + col];
-            if c != '\0' {
-                line.push(c);
+            let s = &snap[vis * cols + col];
+            if s.0 != '\0' {
+                line.push(s.0);
+                line.extend(s.4.iter().copied());
             }
         }
         lines_out.push(line.trim_end().to_string());
@@ -1066,8 +1202,7 @@ fn save_clipboard_image(img: &arboard::ImageData) -> Option<String> {
         .ok()?
         .as_millis();
     let path = std::env::temp_dir().join(format!("dopaterm-paste-{ms}.png"));
-    let rgba =
-        image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.to_vec())?;
+    let rgba = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.to_vec())?;
     rgba.save(&path).ok()?;
     Some(path.to_string_lossy().into_owned())
 }
@@ -1111,11 +1246,13 @@ fn drop_path_text(path: &std::path::Path, wsl: bool) -> String {
 /// The block cursor spans the whole glyph beneath it: a wide char's spacer
 /// cell ('\0') is covered when the cursor sits on its lead cell.
 fn cursor_covers(snap: &[SnapCell], cols: usize, cursor: Point, i: usize, col: usize) -> bool {
-    p_eq(cursor, i, col)
-        || (col > 0 && snap[i * cols + col].0 == '\0' && p_eq(cursor, i, col - 1))
+    p_eq(cursor, i, col) || (col > 0 && snap[i * cols + col].0 == '\0' && p_eq(cursor, i, col - 1))
 }
 
-type SnapCell = (char, [u8; 4], [u8; 4], bool);
+/// (char, fg, bg, bold, zerowidth chars). The last field carries the
+/// combining marks / VS16 / ZWJ / emoji modifiers alacritty stores on the
+/// cell so shaped text keeps the full grapheme cluster.
+type SnapCell = (char, [u8; 4], [u8; 4], bool, Vec<char>);
 
 fn snapshot_grid<E: alacritty_terminal::event::EventListener>(
     term: &alacritty_terminal::Term<E>,
@@ -1127,7 +1264,7 @@ fn snapshot_grid<E: alacritty_terminal::event::EventListener>(
     let content = term.renderable_content();
     let fg = [default_fg[0], default_fg[1], default_fg[2], 255];
     let bg = [default_bg[0], default_bg[1], default_bg[2], 255];
-    let mut snap = vec![(' ', fg, bg, false); cols * rows];
+    let mut snap = vec![(' ', fg, bg, false, Vec::new()); cols * rows];
     for indexed in content.display_iter {
         let line = indexed.point.line.0 + content.display_offset as i32;
         if line < 0 || line as usize >= rows {
@@ -1135,15 +1272,18 @@ fn snapshot_grid<E: alacritty_terminal::event::EventListener>(
         }
         let cell = indexed.cell;
         let (fg, bg) = cell_colors(cell, content.colors, default_fg, default_bg);
-        let ch = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            '\0'
+        let (ch, zero) = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            ('\0', Vec::new())
         } else if cell.c == '\t' {
-            ' '
+            (' ', Vec::new())
         } else {
-            cell.c
+            (
+                cell.c,
+                cell.zerowidth().map(<[char]>::to_vec).unwrap_or_default(),
+            )
         };
         snap[line as usize * cols + indexed.point.column.0] =
-            (ch, fg, bg, cell.flags.contains(Flags::BOLD));
+            (ch, fg, bg, cell.flags.contains(Flags::BOLD), zero);
     }
     snap
 }
@@ -1158,7 +1298,7 @@ fn find_erased(old: &[SnapCell], new: &[SnapCell]) -> Vec<(usize, char, [u8; 4])
     let mut changed = 0usize;
     let mut out = Vec::new();
     for (i, (o, n)) in old.iter().zip(new.iter()).enumerate() {
-        if o.0 != n.0 {
+        if o != n {
             changed += 1;
             if !matches!(o.0, ' ' | '\0') && matches!(n.0, ' ' | '\0') {
                 out.push((i, o.0, o.1));
@@ -1175,12 +1315,12 @@ fn find_erased(old: &[SnapCell], new: &[SnapCell]) -> Vec<(usize, char, [u8; 4])
 mod tests {
     use super::*;
     use crate::term_core::Dims;
+    use alacritty_terminal::Term;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::vte::ansi::Processor;
-    use alacritty_terminal::Term;
 
     fn cell(c: char) -> SnapCell {
-        (c, [255; 4], [0, 0, 0, 255], false)
+        (c, [255; 4], [0, 0, 0, 255], false, Vec::new())
     }
 
     fn feed(t: &mut Term<VoidListener>, bytes: &[u8]) {
@@ -1201,7 +1341,40 @@ mod tests {
         assert_eq!(snap[1].2, snap[0].2);
         assert_eq!(snap[3].2, snap[2].2);
         assert_eq!(snap[1].0, '\0');
-        assert_eq!(snap[..4].iter().map(|cell| cell.0).filter(|ch| *ch != '\0').collect::<String>(), "日本");
+        assert_eq!(
+            snap[..4]
+                .iter()
+                .map(|cell| cell.0)
+                .filter(|ch| *ch != '\0')
+                .collect::<String>(),
+            "日本"
+        );
+    }
+
+    #[test]
+    fn zerowidth_chars_travel_with_their_cell() {
+        // VS16 and emoji modifiers are zero-width: alacritty stores them on
+        // the preceding cell, and the snapshot must carry them so shaping
+        // can form the full emoji cluster.
+        let mut term = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &Dims { cols: 8, lines: 2 },
+            VoidListener,
+        );
+        feed(&mut term, "A\u{2764}\u{FE0F}e\u{0301}\u{1F44D}".as_bytes());
+        let snap = snapshot_grid(&term, [255; 3], [0; 3]);
+        assert_eq!(snap[0].0, 'A');
+        assert_eq!(
+            (snap[1].0, snap[1].4.as_slice()),
+            ('\u{2764}', &['\u{FE0F}'][..])
+        );
+        assert_eq!((snap[2].0, snap[2].4.as_slice()), ('e', &['\u{0301}'][..]));
+        assert_eq!(snap[3].0, '\u{1F44D}');
+        assert_eq!(snap[4].0, '\0');
+        // Zerowidth-only changes still count as a diff for dirty-row marking.
+        let mut other = snap.clone();
+        other[1].4.clear();
+        assert_ne!(snap[1], other[1]);
     }
 
     #[test]
@@ -1264,15 +1437,27 @@ mod tests {
         for c in "tail  ".chars() {
             snap.push(cell(c));
         }
-        let sel = Selection { anchor: (1, 1), head: (2, 3), dragging: false };
+        let sel = Selection {
+            anchor: (1, 1),
+            head: (2, 3),
+            dragging: false,
+        };
         assert_eq!(selected_text(&snap, 6, 3, 0, &sel), "Xc\ntail");
 
         // Reversed drag order selects the same region.
-        let rev = Selection { anchor: (2, 3), head: (1, 1), dragging: false };
+        let rev = Selection {
+            anchor: (2, 3),
+            head: (1, 1),
+            dragging: false,
+        };
         assert_eq!(selected_text(&snap, 6, 3, 0, &rev), "Xc\ntail");
 
         // Buffer-line coordinates account for the scroll offset.
-        let top = Selection { anchor: (0, 0), head: (0, 3), dragging: false };
+        let top = Selection {
+            anchor: (0, 0),
+            head: (0, 3),
+            dragging: false,
+        };
         assert_eq!(selected_text(&snap, 6, 3, 1, &top), "aXc");
     }
 
@@ -1282,7 +1467,10 @@ mod tests {
             drop_path_text(std::path::Path::new("/tmp/a b.png"), false),
             "\"/tmp/a b.png\""
         );
-        assert_eq!(drop_path_text(std::path::Path::new("/tmp/ab.png"), false), "/tmp/ab.png");
+        assert_eq!(
+            drop_path_text(std::path::Path::new("/tmp/ab.png"), false),
+            "/tmp/ab.png"
+        );
     }
 
     #[test]
@@ -1318,7 +1506,10 @@ mod tests {
         );
         feed(&mut term, b"A\tB");
         let snap = snapshot_grid(&term, [255; 3], [0; 3]);
-        assert_eq!(snap[..9].iter().map(|cell| cell.0).collect::<String>(), "A       B");
+        assert_eq!(
+            snap[..9].iter().map(|cell| cell.0).collect::<String>(),
+            "A       B"
+        );
     }
 
     #[test]
@@ -1332,7 +1523,10 @@ mod tests {
     fn doomed_cell_reads_grid() {
         let mut t = Term::new(
             alacritty_terminal::term::Config::default(),
-            &Dims { cols: 80, lines: 24 },
+            &Dims {
+                cols: 80,
+                lines: 24,
+            },
             VoidListener,
         );
         feed(&mut t, b"$ ab");
@@ -1391,12 +1585,17 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         window.set_ime_allowed(true);
-        let renderer = pollster::block_on(Renderer::new(
+        let mut renderer = pollster::block_on(Renderer::new(
             Arc::clone(&window),
             self.cfg.font_size,
             self.cfg.font_family.clone(),
         ))
         .expect("init renderer");
+        // Screenshots are pinned to scale 1 so verification scripts can
+        // assume fixed cell geometry regardless of the monitor's DPI.
+        if self.shot_path.is_some() {
+            renderer.set_scale_factor(1.0);
+        }
         self.cfg.font_family = renderer.font_family().map(str::to_string);
 
         let size = window.inner_size();
@@ -1423,10 +1622,12 @@ impl ApplicationHandler<UserEvent> for App {
 
         // 200ms heartbeat for idle/command-finish detection.
         let wake_proxy = self.proxy.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(200));
-            if wake_proxy.send_event(UserEvent::Wake).is_err() {
-                break;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(200));
+                if wake_proxy.send_event(UserEvent::Wake).is_err() {
+                    break;
+                }
             }
         });
     }
@@ -1441,6 +1642,17 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(term) = &self.term else { return };
         match ev {
             WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Font size is configured in points; re-measure cells so
+                // text keeps its size when the window moves to a display
+                // with a different DPI.
+                if self.shot_path.is_none() {
+                    if let Some(r) = &mut self.renderer {
+                        r.set_scale_factor(scale_factor);
+                    }
+                    self.resize_terminal_to_window();
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
                     // surface.configure can panic on a dead device.
@@ -1460,14 +1672,17 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || event.repeat {
+                if event.state != ElementState::Pressed {
                     return;
                 }
-                if event.logical_key == Key::Named(NamedKey::F1)
-                    || (self.mods.control_key() && self.mods.shift_key()
-                        && matches!(&event.logical_key, Key::Character(c) if c == "," || c == "<"))
+                if !event.repeat
+                    && (event.logical_key == Key::Named(NamedKey::F1)
+                        || (self.mods.control_key()
+                            && self.mods.shift_key()
+                            && matches!(&event.logical_key, Key::Character(c) if c == "," || c == "<")))
                 {
                     self.show_settings = !self.show_settings;
+                    self.settings_fonts = None;
                     self.sync_ime();
                     self.dirty = true;
                     if let Some(w) = &self.window {
@@ -1477,7 +1692,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if self.show_settings {
                     if event.logical_key == Key::Named(NamedKey::Escape) {
-                        self.show_settings = false;
+                        if self.settings_fonts.take().is_none() {
+                            self.show_settings = false;
+                        }
                         self.sync_ime();
                         self.dirty = true;
                         if let Some(w) = &self.window {
@@ -1496,8 +1713,8 @@ impl ApplicationHandler<UserEvent> for App {
                         t.mode().contains(TermMode::ALT_SCREEN),
                     )
                 };
-                // Paste / copy shortcuts.
-                if self.mods.control_key() && self.mods.shift_key() {
+                // Paste / copy shortcuts fire once per press, not per repeat.
+                if !event.repeat && self.mods.control_key() && self.mods.shift_key() {
                     if let winit::keyboard::Key::Character(c) = &event.logical_key {
                         if c.eq_ignore_ascii_case("v") {
                             self.paste_clipboard(term);
@@ -1513,7 +1730,12 @@ impl ApplicationHandler<UserEvent> for App {
                     term.write(&d.bytes);
                     term.term.lock().scroll_display(Scroll::Bottom);
                     let (x, y) = self.last_cursor_px;
-                    self.fx.event(&FxEvent::Key { kind: d.kind, ch: d.ch, x, y });
+                    self.fx.event(&FxEvent::Key {
+                        kind: d.kind,
+                        ch: d.ch,
+                        x,
+                        y,
+                    });
                     let shatter_col = match &event.logical_key {
                         Key::Named(NamedKey::Backspace) => Some(-1),
                         Key::Named(NamedKey::Delete) => Some(0),
@@ -1528,7 +1750,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if d.kind == KeyKind::Enter && !alt_screen {
                         self.command_pending = true;
                     }
-                    if d.kind == KeyKind::Enter {
+                    if d.kind == KeyKind::Enter && !event.repeat {
                         let w = self.window.as_ref().unwrap().inner_size();
                         self.fx.event(&FxEvent::Confetti {
                             x,
@@ -1542,7 +1764,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let Some(r) = self.renderer.as_ref() else { return };
+                let Some(r) = self.renderer.as_ref() else {
+                    return;
+                };
                 let x = position.x as f32;
                 let y = position.y as f32;
                 self.mouse_px = (x, y);
@@ -1631,12 +1855,18 @@ impl ApplicationHandler<UserEvent> for App {
                     self.ime_composing = false;
                     return;
                 }
-                let starting_composition = cfg!(windows) && matches!(&ime, winit::event::Ime::Enabled);
+                let starting_composition =
+                    cfg!(windows) && matches!(&ime, winit::event::Ime::Enabled);
                 if let Some(text) = self.ime_preedit.update(ime) {
                     term.write(text.as_bytes());
                     term.term.lock().scroll_display(Scroll::Bottom);
                     let (x, y) = self.last_cursor_px;
-                    self.fx.event(&FxEvent::Key { kind: KeyKind::Char, ch: text.chars().next(), x, y });
+                    self.fx.event(&FxEvent::Key {
+                        kind: KeyKind::Char,
+                        ch: text.chars().next(),
+                        x,
+                        y,
+                    });
                 }
                 self.ime_composing = starting_composition || self.ime_preedit.active();
                 self.last_activity = Instant::now();
@@ -1662,6 +1892,29 @@ impl ApplicationHandler<UserEvent> for App {
                 self.window.as_ref().unwrap().request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.show_settings {
+                    // The wheel scrolls the font picker page; the main
+                    // settings page fits without scrolling.
+                    if self.settings_fonts.is_some() {
+                        let lines = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => y as i32,
+                            MouseScrollDelta::PixelDelta(p) => (p.y as f32 / 20.0).round() as i32,
+                        };
+                        if lines != 0 {
+                            let total = self
+                                .renderer
+                                .as_ref()
+                                .map(|r| r.font_families().len())
+                                .unwrap_or(0);
+                            let max = total.saturating_sub(settings_ui::FONT_LIST_ROWS) as i32;
+                            let cur = self.settings_fonts.unwrap_or(0) as i32;
+                            self.settings_fonts = Some((cur - lines).clamp(0, max) as usize);
+                            self.dirty = true;
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
+                    }
+                    return;
+                }
                 let mode = self.mouse_mode(term);
                 if crate::mouse::tracking_enabled(mode) && !self.mods.shift_key() {
                     let button = match delta {
@@ -1677,9 +1930,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => -y as i32,
-                    MouseScrollDelta::PixelDelta(p) => {
-                        -(p.y as f32 / 20.0).round() as i32
-                    }
+                    MouseScrollDelta::PixelDelta(p) => -(p.y as f32 / 20.0).round() as i32,
                 };
                 if lines != 0 {
                     term.term.lock().scroll_display(Scroll::Delta(lines));
@@ -1714,7 +1965,15 @@ impl ApplicationHandler<UserEvent> for App {
                     // callback and kill the event loop — the exact "frozen
                     // window" symptom — so treat it as a render failure too.
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        r.render(clear, &self.draw_quads, &self.lines, &self.dirty_lines, &fx_instances, &overlay_bg, &overlay_lines)
+                        r.render(
+                            clear,
+                            &self.draw_quads,
+                            &self.lines,
+                            &self.dirty_lines,
+                            &fx_instances,
+                            &overlay_bg,
+                            &overlay_lines,
+                        )
                     }));
                     match result {
                         Ok(Ok(FrameOutcome::Presented)) => {
@@ -1739,7 +1998,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 .last_renderer_reset
                                 .is_some_and(|t| t.elapsed() < Duration::from_secs(10));
                             if self.skipped_frames >= 60 && recent_reset {
-                                eprintln!("dopaterm: frames not reaching window; recreating window");
+                                eprintln!(
+                                    "dopaterm: frames not reaching window; recreating window"
+                                );
                                 self.skipped_frames = 0;
                                 self.recreate_window_and_renderer(el);
                             } else if recent_reset {
@@ -1780,7 +2041,12 @@ impl ApplicationHandler<UserEvent> for App {
                         let (cw, ch) = (r.cell_w, r.cell_h);
                         let ws = self.window.as_ref().unwrap().inner_size();
                         for _ in 0..4 {
-                            self.fx.event(&FxEvent::Key { kind: crate::input::KeyKind::Char, ch: Some('x'), x, y });
+                            self.fx.event(&FxEvent::Key {
+                                kind: crate::input::KeyKind::Char,
+                                ch: Some('x'),
+                                x,
+                                y,
+                            });
                         }
                         self.fx.event(&FxEvent::Erased {
                             ch: 'x',
@@ -1798,8 +2064,16 @@ impl ApplicationHandler<UserEvent> for App {
                             dx: cw * 8.0,
                             dy: ch * 2.0,
                         });
-                        self.fx.event(&FxEvent::Bell { x: x + cw * 8.0, y: y + ch * 2.0, w: cw, h: ch });
-                        self.fx.event(&FxEvent::CommandDone { x: x + 380.0, y: y + 340.0 });
+                        self.fx.event(&FxEvent::Bell {
+                            x: x + cw * 8.0,
+                            y: y + ch * 2.0,
+                            w: cw,
+                            h: ch,
+                        });
+                        self.fx.event(&FxEvent::CommandDone {
+                            x: x + 380.0,
+                            y: y + 340.0,
+                        });
                         self.fx.event(&FxEvent::Waiting { x, y });
                         self.fx.event(&FxEvent::ChildError {
                             x: x + 220.0,
@@ -1823,23 +2097,48 @@ impl ApplicationHandler<UserEvent> for App {
                             self.show_settings = true;
                             self.sync_ime();
                         }
+                        if std::env::var_os("DOPA_FONTLIST_DEMO").is_some() {
+                            self.show_settings = true;
+                            self.sync_ime();
+                            self.open_font_list();
+                        }
                         if std::env::var_os("DOPA_IME_DEMO").is_some() {
                             let text = "日本語入力中".to_string();
                             let end = text.len();
-                            self.ime_preedit.update(winit::event::Ime::Preedit(text, Some((end, end))));
+                            self.ime_preedit
+                                .update(winit::event::Ime::Preedit(text, Some((end, end))));
+                        }
+                        // Feed literal bytes (incl. escapes) into the grid —
+                        // verifies rendering independent of the shell.
+                        if let Ok(feed) = std::env::var("DOPA_FEED") {
+                            let mut p = alacritty_terminal::vte::ansi::Processor::<
+                                alacritty_terminal::vte::ansi::StdSyncHandler,
+                            >::new();
+                            let arc = self.term.as_ref().unwrap().term.clone();
+                            p.advance(&mut *arc.lock(), feed.as_bytes());
                         }
                         self.build_frame();
                         self.fx.tick(0.05);
                         let fx_instances: Vec<Instance> = self.fx.instances().to_vec();
                         let w = self.window.as_ref().unwrap().inner_size();
-                        let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(self.frame_bg));
+                        let clear =
+                            crate::colors::srgb_to_linear(crate::colors::to_f32_3(self.frame_bg));
                         let (overlay_bg, overlay_lines, hits) = self.build_overlay();
                         self.settings_hits = hits;
                         self.draw_quads.clear();
                         self.draw_quads.extend_from_slice(&self.bgs);
                         self.draw_quads.extend_from_slice(&self.sel_quads);
                         let r = self.renderer.as_mut().unwrap();
-                        match r.screenshot(w.width, w.height, clear, &self.draw_quads, &self.lines, &fx_instances, &overlay_bg, &overlay_lines) {
+                        match r.screenshot(
+                            w.width,
+                            w.height,
+                            clear,
+                            &self.draw_quads,
+                            &self.lines,
+                            &fx_instances,
+                            &overlay_bg,
+                            &overlay_lines,
+                        ) {
                             Ok(px) => {
                                 if let Err(e) = image::save_buffer(
                                     &path,
