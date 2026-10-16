@@ -33,15 +33,16 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let mut cfg_path: Option<PathBuf> = None;
     let mut shell: Option<String> = None;
-    let mut intensity: Option<String> = None;
+    let mut amount: Option<f32> = None;
+    let mut no_fx = false;
     let mut shot: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => cfg_path = args.next().map(PathBuf::from),
             "--shell" | "-e" => shell = args.next(),
-            "--calm" => intensity = Some("low".into()),
-            "--max" => intensity = Some("max".into()),
-            "--no-fx" => intensity = Some("off".into()),
+            "--calm" => amount = Some(0.4),
+            "--max" => amount = Some(1.0),
+            "--no-fx" => no_fx = true,
             "--screenshot" => shot = args.next().map(PathBuf::from),
             "--debug-console" => {
                 #[cfg(windows)]
@@ -52,14 +53,17 @@ fn main() -> anyhow::Result<()> {
                 win_console::attach_parent();
                 println!(
                     "dopaterm - virtual terminal with input/output effects\n\
-                     usage: dopaterm [--config FILE] [--shell CMD] [--calm|--max|--no-fx] [--debug-console]\n\
+                     usage: dopaterm [--config FILE] [--shell CMD] [--calm|--max|--no-fx|--amount=0.0-1.0] [--debug-console]\n\
                      config: <config dir>/dopaterm/config.toml, lua effects: <config dir>/dopaterm/effects/*.lua"
                 );
                 return Ok(());
             }
             other => {
-                if other.starts_with("--intensity=") {
-                    intensity = Some(other.trim_start_matches("--intensity=").into());
+                if let Some(v) = other
+                    .strip_prefix("--amount=")
+                    .and_then(|s| s.parse::<f32>().ok())
+                {
+                    amount = Some(v.clamp(0.0, 1.0));
                 }
             }
         }
@@ -69,13 +73,12 @@ fn main() -> anyhow::Result<()> {
     if let Some(s) = shell {
         cfg.shell = Some(s);
     }
-    if let Some(i) = intensity {
-        cfg.intensity = match i.as_str() {
-            "off" => config::Intensity::Off,
-            "low" => config::Intensity::Low,
-            "max" => config::Intensity::Max,
-            _ => config::Intensity::Normal,
-        };
+    if let Some(v) = amount {
+        cfg.amount = v;
+    }
+    if no_fx {
+        cfg.amount = 0.0;
+        cfg.effects.amounts = config::EffectAmounts::uniform(Some(0.0));
     }
 
     alacritty_terminal::tty::setup_env();

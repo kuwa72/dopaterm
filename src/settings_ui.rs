@@ -3,13 +3,26 @@
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::config::{Config, Intensity};
+use crate::config::{Config, EffectAmounts};
 use crate::fx::{Instance, SHAPE_RECT};
 use crate::render::{Line, Span};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    General,
+    Effects,
+}
+
+#[derive(Clone, Copy)]
 pub enum Action {
-    Intensity(Intensity),
-    Toggle(&'static str),
+    /// Switch the settings page.
+    SetPage(Page),
+    /// Adjust the global amount (delta, e.g. -0.1 / +0.1).
+    MasterAmount(f32),
+    /// Adjust a per-effect override by `delta`; creates an explicit value.
+    Amount(&'static str, f32),
+    /// Reset a per-effect override to "inherit the global amount".
+    AmountAuto(&'static str),
     ShellNext,
     Theme(&'static str),
     FontSize(f32),
@@ -26,6 +39,10 @@ pub enum Action {
 
 pub struct Hit {
     pub rect: (f32, f32, f32, f32), // x, y, w, h
+    /// Logical row index; hits sharing a row form one keyboard focus target.
+    pub row: u32,
+    /// -1 = decrement, +1 = increment, 0 = activate. Drives Left/Right keys.
+    pub dir: i8,
     pub action: Action,
 }
 
@@ -121,8 +138,9 @@ fn font_label(family: Option<&str>) -> String {
     truncate_cols(&format!("Font: {}", family.unwrap_or("(system)")), 36)
 }
 
-/// `font_scroll`: `Some(first_visible_index)` shows the font picker page
-/// instead of the main settings page.
+/// `page` selects the tab; `font_scroll` `Some(first_visible_index)` shows the
+/// font picker page instead. `focus_row` highlights a row for keyboard use.
+#[allow(unused_assignments)] // last `end_row!` increment is intentionally unused
 pub fn build(
     cfg: &Config,
     ww: f32,
@@ -130,13 +148,18 @@ pub fn build(
     cw: f32,
     ch: f32,
     fonts: &[String],
+    page: Page,
     font_scroll: Option<usize>,
+    focus_row: Option<u32>,
 ) -> (Vec<Instance>, Vec<Line>, Vec<Hit>) {
     if let Some(scroll) = font_scroll {
-        return build_font_list(cfg, ww, wh, cw, ch, fonts, scroll);
+        return build_font_list(cfg, ww, wh, cw, ch, fonts, scroll, focus_row);
     }
     let row_h = ch * 1.8;
-    let rows = 16f32;
+    let rows = match page {
+        Page::General => 8.0,
+        Page::Effects => 12.0,
+    };
     let panel_w = (cw * PANEL_COLS).min(ww);
     let panel_h = rows * row_h + PADDING_Y * 2.0;
     let px = (ww - panel_w).max(0.0) / 2.0;
@@ -148,6 +171,7 @@ pub fn build(
     let text = hex([0xc5, 0xc8, 0xc6]);
     let dim = hex([0x70, 0x74, 0x78]);
     let accent = hex([0xf0, 0xc6, 0x74]);
+    let focus_bg = hex([0x45, 0x4b, 0x57]);
 
     let mut bgs = Vec::new();
     let mut lines = Vec::new();
@@ -157,8 +181,18 @@ pub fn build(
     bgs.push(rect(px, py, panel_w, row_h + PADDING_Y, title_bg));
 
     let mut y = py + PADDING_Y;
+    let mut row = 0u32;
+    macro_rules! end_row {
+        () => {{
+            if focus_row == Some(row) {
+                bgs.push(rect(px, y - ch * 0.2, panel_w, row_h, focus_bg));
+            }
+            row += 1;
+            y += row_h;
+        }};
+    }
 
-    // Title.
+    // Title + tab bar (row 0).
     lines.push(Line {
         top: y,
         left: text_x,
@@ -169,256 +203,281 @@ pub fn build(
         }],
         family: None,
     });
-    y += row_h;
-
-    // Shell row.
-    let shell_label = format!("Shell: {}", cfg.shell.as_deref().unwrap_or("(default)"));
-    lines.push(Line {
-        top: y,
-        left: text_x,
-        spans: vec![Span {
-            text: shell_label,
-            fg: text,
-            bold: false,
-        }],
-        family: None,
-    });
-    lines.push(Line {
-        top: y,
-        left: text_x + cw * 35.0,
-        spans: vec![Span {
-            text: "[next]".into(),
-            fg: text,
-            bold: false,
-        }],
-        family: None,
-    });
-    hits.push(Hit {
-        rect: (text_x + cw * 34.0, y - ch * 0.2, cw * 7.0, row_h),
-        action: Action::ShellNext,
-    });
-    y += row_h;
-
-    // Theme row.
-    let current_theme = THEMES
-        .iter()
-        .find(|(_, bg, fg)| *bg == cfg.background && *fg == cfg.foreground)
-        .map(|(name, _, _)| *name)
-        .unwrap_or("custom");
-    lines.push(Line {
-        top: y,
-        left: text_x,
-        spans: vec![Span {
-            text: format!("Theme: {}", current_theme),
-            fg: text,
-            bold: false,
-        }],
-        family: None,
-    });
-    let mut theme_x = text_x + cw * 14.0;
-    for (name, _, _) in THEMES {
-        let is_on = current_theme == *name;
-        let color = if is_on { accent } else { dim };
+    let mut tx = text_x + cw * 40.0;
+    for p in [Page::General, Page::Effects] {
+        let name = match p {
+            Page::General => "general",
+            Page::Effects => "effects",
+        };
+        let is_on = page == p;
         lines.push(Line {
             top: y,
-            left: theme_x,
-            spans: vec![
-                Span {
-                    text: "[".into(),
-                    fg: dim,
-                    bold: false,
-                },
-                Span {
-                    text: (*name).into(),
-                    fg: color,
-                    bold: is_on,
-                },
-                Span {
-                    text: "] ".into(),
-                    fg: dim,
-                    bold: false,
-                },
-            ],
+            left: tx,
+            spans: vec![Span {
+                text: format!("[{}]", name),
+                fg: if is_on { accent } else { dim },
+                bold: is_on,
+            }],
             family: None,
         });
         hits.push(Hit {
-            rect: (theme_x - cw, y - ch * 0.2, cw * 8.0, row_h),
-            action: Action::Theme(name),
+            rect: (tx - cw * 0.5, y - ch * 0.2, cw * 9.0, row_h),
+            row,
+            dir: 0,
+            action: Action::SetPage(p),
         });
-        theme_x += cw * 8.0;
+        tx += cw * 10.0;
     }
-    y += row_h;
+    end_row!();
 
-    // Font size row.
-    lines.push(Line {
-        top: y,
-        left: text_x,
-        spans: vec![Span {
-            text: format!("Font size: {:.0}", cfg.font_size),
-            fg: text,
-            bold: false,
-        }],
-        family: None,
-    });
-    lines.push(Line {
-        top: y,
-        left: text_x + cw * 25.0,
-        spans: vec![Span {
-            text: "[-]".into(),
-            fg: text,
-            bold: false,
-        }],
-        family: None,
-    });
-    hits.push(Hit {
-        rect: (text_x + cw * 24.0, y - ch * 0.2, cw * 4.0, row_h),
-        action: Action::FontSize(-1.0),
-    });
-    lines.push(Line {
-        top: y,
-        left: text_x + cw * 29.0,
-        spans: vec![Span {
-            text: "[+]".into(),
-            fg: text,
-            bold: false,
-        }],
-        family: None,
-    });
-    hits.push(Hit {
-        rect: (text_x + cw * 28.0, y - ch * 0.2, cw * 4.0, row_h),
-        action: Action::FontSize(1.0),
-    });
-    y += row_h;
-
-    // Font family row.
-    let font_family = crate::fonts::resolve_family(cfg.font_family.as_deref(), fonts);
-    lines.push(Line {
-        top: y,
-        left: text_x,
-        spans: vec![Span {
-            text: font_label(font_family.as_deref()),
-            fg: text,
-            bold: false,
-        }],
-        family: None,
-    });
-    if !fonts.is_empty() {
-        for (i, (label, action)) in [
-            ("[prev]", Action::FontPrev),
-            ("[next]", Action::FontNext),
-            ("[list]", Action::FontList),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let bx = text_x + cw * (38.0 + i as f32 * 7.0);
+    match page {
+        Page::General => {
+            // Shell row.
             lines.push(Line {
                 top: y,
-                left: bx,
+                left: text_x,
                 spans: vec![Span {
-                    text: label.into(),
+                    text: format!(
+                        "Shell: {}",
+                        truncate_cols(cfg.shell.as_deref().unwrap_or("(default)"), 28)
+                    ),
+                    fg: text,
+                    bold: false,
+                }],
+                family: None,
+            });
+            lines.push(Line {
+                top: y,
+                left: text_x + cw * 42.0,
+                spans: vec![Span {
+                    text: "[next]".into(),
                     fg: text,
                     bold: false,
                 }],
                 family: None,
             });
             hits.push(Hit {
-                rect: (bx - cw * 0.5, y - ch * 0.2, cw * 6.0, row_h),
-                action,
+                rect: (text_x + cw * 41.0, y - ch * 0.2, cw * 7.0, row_h),
+                row,
+                dir: 0,
+                action: Action::ShellNext,
             });
+            end_row!();
+
+            // Theme row.
+            let current_theme = THEMES
+                .iter()
+                .find(|(_, bg, fg)| *bg == cfg.background && *fg == cfg.foreground)
+                .map(|(name, _, _)| *name)
+                .unwrap_or("custom");
+            lines.push(Line {
+                top: y,
+                left: text_x,
+                spans: vec![Span {
+                    text: format!("Theme: {}", current_theme),
+                    fg: text,
+                    bold: false,
+                }],
+                family: None,
+            });
+            let mut theme_x = text_x + cw * 14.0;
+            for (name, _, _) in THEMES {
+                let is_on = current_theme == *name;
+                lines.push(Line {
+                    top: y,
+                    left: theme_x,
+                    spans: vec![Span {
+                        text: format!("[{}]", name),
+                        fg: if is_on { accent } else { dim },
+                        bold: is_on,
+                    }],
+                    family: None,
+                });
+                hits.push(Hit {
+                    rect: (theme_x - cw, y - ch * 0.2, cw * 8.0, row_h),
+                    row,
+                    dir: 0,
+                    action: Action::Theme(name),
+                });
+                theme_x += cw * 8.0;
+            }
+            end_row!();
+
+            // Font size row.
+            lines.push(Line {
+                top: y,
+                left: text_x,
+                spans: vec![Span {
+                    text: format!("Font size: {:.0}", cfg.font_size),
+                    fg: text,
+                    bold: false,
+                }],
+                family: None,
+            });
+            for (i, (label, delta, dir)) in
+                [("[-]", -1.0f32, -1i8), ("[+]", 1.0, 1)].iter().enumerate()
+            {
+                let bx = text_x + cw * (24.0 + i as f32 * 5.0);
+                lines.push(Line {
+                    top: y,
+                    left: bx,
+                    spans: vec![Span {
+                        text: label.to_string(),
+                        fg: text,
+                        bold: false,
+                    }],
+                    family: None,
+                });
+                hits.push(Hit {
+                    rect: (bx - cw * 0.5, y - ch * 0.2, cw * 4.0, row_h),
+                    row,
+                    dir: *dir,
+                    action: Action::FontSize(*delta),
+                });
+            }
+            end_row!();
+
+            // Font family row.
+            let font_family = crate::fonts::resolve_family(cfg.font_family.as_deref(), fonts);
+            lines.push(Line {
+                top: y,
+                left: text_x,
+                spans: vec![Span {
+                    text: font_label(font_family.as_deref()),
+                    fg: text,
+                    bold: false,
+                }],
+                family: None,
+            });
+            if !fonts.is_empty() {
+                for (i, (label, action, dir)) in [
+                    ("[prev]", Action::FontPrev, -1i8),
+                    ("[next]", Action::FontNext, 1),
+                    ("[list]", Action::FontList, 0),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let bx = text_x + cw * (38.0 + i as f32 * 7.0);
+                    lines.push(Line {
+                        top: y,
+                        left: bx,
+                        spans: vec![Span {
+                            text: label.into(),
+                            fg: text,
+                            bold: false,
+                        }],
+                        family: None,
+                    });
+                    hits.push(Hit {
+                        rect: (bx - cw * 0.5, y - ch * 0.2, cw * 6.0, row_h),
+                        row,
+                        dir,
+                        action,
+                    });
+                }
+            }
+            end_row!();
+
+            // Master amount row.
+            lines.push(Line {
+                top: y,
+                left: text_x,
+                spans: vec![Span {
+                    text: format!("Effect amount: {:.2}", cfg.amount),
+                    fg: text,
+                    bold: false,
+                }],
+                family: None,
+            });
+            for (i, (label, delta, dir)) in
+                [("[-]", -0.1f32, -1i8), ("[+]", 0.1, 1)].iter().enumerate()
+            {
+                let bx = text_x + cw * (24.0 + i as f32 * 5.0);
+                lines.push(Line {
+                    top: y,
+                    left: bx,
+                    spans: vec![Span {
+                        text: label.to_string(),
+                        fg: text,
+                        bold: false,
+                    }],
+                    family: None,
+                });
+                hits.push(Hit {
+                    rect: (bx - cw * 0.5, y - ch * 0.2, cw * 4.0, row_h),
+                    row,
+                    dir: *dir,
+                    action: Action::MasterAmount(*delta),
+                });
+            }
+            end_row!();
         }
-    }
-    y += row_h;
-
-    // Separator.
-    lines.push(Line {
-        top: y,
-        left: text_x,
-        spans: vec![Span {
-            text: "Effects".into(),
-            fg: dim,
-            bold: false,
-        }],
-        family: None,
-    });
-    y += row_h;
-
-    // Intensity row.
-    let intensity_opts = [
-        ("Off", Intensity::Off),
-        ("Low", Intensity::Low),
-        ("Normal", Intensity::Normal),
-        ("Max", Intensity::Max),
-    ];
-    let mut spans: Vec<Span> = vec![Span {
-        text: "Intensity: ".into(),
-        fg: text,
-        bold: false,
-    }];
-    let opt_w = cw * 6.0;
-    let first_opt_x = text_x + cw * 12.0;
-    let mut ix = first_opt_x;
-    for (label, val) in &intensity_opts {
-        let is_on = cfg.intensity == *val;
-        let color = if is_on { accent } else { dim };
-        spans.push(Span {
-            text: "[".into(),
-            fg: dim,
-            bold: false,
-        });
-        spans.push(Span {
-            text: label.to_string(),
-            fg: color,
-            bold: is_on,
-        });
-        spans.push(Span {
-            text: "] ".into(),
-            fg: dim,
-            bold: false,
-        });
-        hits.push(Hit {
-            rect: (ix - cw, y - ch * 0.2, opt_w, row_h),
-            action: Action::Intensity(*val),
-        });
-        ix += opt_w;
-    }
-    lines.push(Line {
-        top: y,
-        left: text_x,
-        spans,
-        family: None,
-    });
-    y += row_h;
-
-    // Effects toggles.
-    let toggles: [(&str, bool); 8] = [
-        ("sparks", cfg.effects.sparks),
-        ("shatter", cfg.effects.shatter),
-        ("cursor_trail", cfg.effects.cursor_trail),
-        ("fireworks", cfg.effects.fireworks),
-        ("wait_pulse", cfg.effects.wait_pulse),
-        ("confetti", cfg.effects.confetti),
-        ("output_rain", cfg.effects.output_rain),
-        ("process_error", cfg.effects.process_error),
-    ];
-    let check_x = px + panel_w - PADDING_X - cw * 4.0;
-    for (name, on) in toggles {
-        let line_text = format!("{:<18} {}", name, if on { "[x]" } else { "[ ]" });
-        lines.push(Line {
-            top: y,
-            left: text_x,
-            spans: vec![Span {
-                text: line_text,
-                fg: text,
-                bold: false,
-            }],
-            family: None,
-        });
-        hits.push(Hit {
-            rect: (check_x - cw, y - ch * 0.2, cw * 4.0, row_h),
-            action: Action::Toggle(name),
-        });
-        y += row_h;
+        Page::Effects => {
+            lines.push(Line {
+                top: y,
+                left: text_x,
+                spans: vec![Span {
+                    text: "amount: 0 = off, blank = inherit master".into(),
+                    fg: dim,
+                    bold: false,
+                }],
+                family: None,
+            });
+            end_row!();
+            for name in EffectAmounts::NAMES {
+                let explicit = cfg.effects.amounts.get(name);
+                let effective = explicit.unwrap_or(cfg.amount);
+                let val = match explicit {
+                    Some(v) => format!("{:.2}", v),
+                    None => format!("auto {:.2}", effective),
+                };
+                lines.push(Line {
+                    top: y,
+                    left: text_x,
+                    spans: vec![
+                        Span {
+                            text: format!("{:<16}", name),
+                            fg: text,
+                            bold: false,
+                        },
+                        Span {
+                            text: val,
+                            fg: if explicit.is_some() { accent } else { dim },
+                            bold: explicit.is_some(),
+                        },
+                    ],
+                    family: None,
+                });
+                for (i, (label, dir, action)) in [
+                    ("[-]", -1i8, Action::Amount(name, -0.1)),
+                    ("[+]", 1, Action::Amount(name, 0.1)),
+                    ("[auto]", 0, Action::AmountAuto(name)),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let bx = text_x + cw * (30.0 + i as f32 * 7.0);
+                    lines.push(Line {
+                        top: y,
+                        left: bx,
+                        spans: vec![Span {
+                            text: label.into(),
+                            fg: text,
+                            bold: false,
+                        }],
+                        family: None,
+                    });
+                    hits.push(Hit {
+                        rect: (bx - cw * 0.5, y - ch * 0.2, cw * 6.0, row_h),
+                        row,
+                        dir,
+                        action,
+                    });
+                }
+                end_row!();
+            }
+        }
     }
 
     // Close button.
@@ -437,8 +496,11 @@ pub fn build(
     });
     hits.push(Hit {
         rect: (close_x, y - ch * 0.2, close_w, row_h),
+        row,
+        dir: 0,
         action: Action::Close,
     });
+    end_row!();
 
     (bgs, lines, hits)
 }
@@ -446,6 +508,7 @@ pub fn build(
 /// Font picker page: each family name is rendered in its own typeface
 /// (Line.family), and clicking a row applies it immediately so the list
 /// itself is the preview.
+#[allow(unused_assignments)] // last `end_row!` increment is intentionally unused
 fn build_font_list(
     cfg: &Config,
     ww: f32,
@@ -454,6 +517,7 @@ fn build_font_list(
     ch: f32,
     fonts: &[String],
     scroll: usize,
+    focus_row: Option<u32>,
 ) -> (Vec<Instance>, Vec<Line>, Vec<Hit>) {
     let row_h = ch * 1.8;
     let visible = fonts.len().min(FONT_LIST_ROWS);
@@ -470,8 +534,9 @@ fn build_font_list(
     let text = hex([0xc5, 0xc8, 0xc6]);
     let dim = hex([0x70, 0x74, 0x78]);
     let accent = hex([0xf0, 0xc6, 0x74]);
+    let focus_bg = hex([0x45, 0x4b, 0x57]);
 
-    let bgs = vec![
+    let mut bgs = vec![
         rect(px, py, panel_w, panel_h, panel_bg),
         rect(px, py, panel_w, row_h + PADDING_Y, title_bg),
     ];
@@ -479,6 +544,16 @@ fn build_font_list(
     let mut hits = Vec::new();
 
     let mut y = py + PADDING_Y;
+    let mut row = 0u32;
+    macro_rules! end_row {
+        () => {{
+            if focus_row == Some(row) {
+                bgs.push(rect(px, y - ch * 0.2, panel_w, row_h, focus_bg));
+            }
+            row += 1;
+            y += row_h;
+        }};
+    }
     lines.push(Line {
         top: y,
         left: text_x,
@@ -499,7 +574,7 @@ fn build_font_list(
         }],
         family: None,
     });
-    y += row_h;
+    end_row!();
 
     let current = crate::fonts::resolve_family(cfg.font_family.as_deref(), fonts);
     let name_cols = (((panel_w - PADDING_X * 2.0) / cw) as usize).saturating_sub(2);
@@ -524,9 +599,11 @@ fn build_font_list(
         });
         hits.push(Hit {
             rect: (px, y - ch * 0.2, panel_w, row_h),
+            row,
+            dir: 0,
             action: Action::FontSelect(i),
         });
-        y += row_h;
+        end_row!();
     }
 
     lines.push(Line {
@@ -541,26 +618,30 @@ fn build_font_list(
     });
     hits.push(Hit {
         rect: (text_x - cw * 0.5, y - ch * 0.2, cw * 7.0, row_h),
+        row,
+        dir: 0,
         action: Action::FontBack,
     });
+    end_row!();
 
     (bgs, lines, hits)
 }
 
 pub fn apply_action(cfg: &mut Config, action: &Action, fonts: &[String]) {
     match action {
-        Action::Intensity(i) => cfg.intensity = *i,
-        Action::Toggle(field) => match *field {
-            "sparks" => cfg.effects.sparks = !cfg.effects.sparks,
-            "shatter" => cfg.effects.shatter = !cfg.effects.shatter,
-            "cursor_trail" => cfg.effects.cursor_trail = !cfg.effects.cursor_trail,
-            "fireworks" => cfg.effects.fireworks = !cfg.effects.fireworks,
-            "wait_pulse" => cfg.effects.wait_pulse = !cfg.effects.wait_pulse,
-            "confetti" => cfg.effects.confetti = !cfg.effects.confetti,
-            "output_rain" => cfg.effects.output_rain = !cfg.effects.output_rain,
-            "process_error" => cfg.effects.process_error = !cfg.effects.process_error,
-            _ => {}
-        },
+        Action::SetPage(_) => {}
+        Action::MasterAmount(delta) => {
+            cfg.amount = (cfg.amount + delta).clamp(0.0, 1.0);
+        }
+        Action::Amount(field, delta) => {
+            let cur = cfg.effects.amounts.get(field).unwrap_or(cfg.amount);
+            cfg.effects
+                .amounts
+                .set(field, Some((cur + delta).clamp(0.0, 1.0)));
+        }
+        Action::AmountAuto(field) => {
+            cfg.effects.amounts.set(field, None);
+        }
         Action::ShellNext => {
             cfg.shell = cycle_option(cfg.shell.as_deref(), SHELLS);
         }
@@ -636,7 +717,17 @@ mod tests {
         let fonts: Vec<String> = (0..20).map(|i| format!("Mono {i}")).collect();
         let mut cfg = Config::default();
         cfg.font_family = Some("Mono 3".into());
-        let (_, lines, hits) = build(&cfg, 960.0, 600.0, 8.0, 18.0, &fonts, Some(2));
+        let (_, lines, hits) = build(
+            &cfg,
+            960.0,
+            600.0,
+            8.0,
+            18.0,
+            &fonts,
+            Page::General,
+            Some(2),
+            None,
+        );
         let selects: Vec<usize> = hits
             .iter()
             .filter_map(|h| match h.action {
@@ -667,7 +758,17 @@ mod tests {
     fn empty_catalog_has_no_font_selection_button() {
         let mut cfg = Config::default();
         cfg.font_family = Some("Unavailable Font".into());
-        let (_, lines, hits) = build(&cfg, 960.0, 600.0, 8.0, 18.0, &[], None);
+        let (_, lines, hits) = build(
+            &cfg,
+            960.0,
+            600.0,
+            8.0,
+            18.0,
+            &[],
+            Page::General,
+            None,
+            None,
+        );
         assert!(
             !hits
                 .iter()

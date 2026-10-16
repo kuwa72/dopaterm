@@ -12,7 +12,9 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::tty::Shell;
 use alacritty_terminal::vte::ansi::CursorShape;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    ElementState, KeyEvent, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -97,6 +99,10 @@ pub struct App {
     ime_preedit: crate::ime::Preedit,
     /// Settings overlay state.
     show_settings: bool,
+    /// Active settings tab.
+    settings_page: crate::settings_ui::Page,
+    /// Keyboard-focused row id within the settings overlay.
+    settings_focus: u32,
     /// Font picker page state: `Some` = first visible index into the
     /// renderer's monospace family catalog.
     settings_fonts: Option<usize>,
@@ -151,6 +157,8 @@ impl App {
             ime_composing: false,
             ime_preedit: crate::ime::Preedit::default(),
             show_settings: false,
+            settings_page: crate::settings_ui::Page::General,
+            settings_focus: 0,
             settings_fonts: None,
             mouse_demo_done: false,
             settings_hits: Vec::new(),
@@ -174,7 +182,9 @@ impl App {
             r.cell_w,
             r.cell_h,
             r.font_families(),
+            self.settings_page,
             self.settings_fonts,
+            Some(self.settings_focus),
         )
     }
 
@@ -340,35 +350,20 @@ impl App {
 
     fn update_effects(&mut self) {
         self.fx.clear();
-        let scale = self.cfg.intensity.scale();
-        self.fx.set_scale(scale);
-        if scale <= 0.0 {
-            return;
-        }
-        if self.cfg.effects.sparks {
-            self.fx.push(Box::new(fx::builtin::Sparks::new()));
-        }
-        if self.cfg.effects.shatter {
-            self.fx.push(Box::new(fx::builtin::Shatter::new()));
-        }
-        if self.cfg.effects.cursor_trail {
-            self.fx.push(Box::new(fx::builtin::CursorTrail::new()));
-        }
-        if self.cfg.effects.fireworks {
-            self.fx.push(Box::new(fx::builtin::Fireworks::new()));
-        }
-        if self.cfg.effects.wait_pulse {
-            self.fx.push(Box::new(fx::builtin::WaitPulse::new()));
-        }
-        if self.cfg.effects.confetti {
-            self.fx.push(Box::new(fx::builtin::Confetti::new()));
-        }
-        if self.cfg.effects.output_rain {
-            self.fx.push(Box::new(fx::builtin::OutputRain::new()));
-        }
+        self.fx.set_global(self.cfg.amount);
+        self.fx.push(Box::new(fx::builtin::Sparks::new()));
+        self.fx.push(Box::new(fx::builtin::Shatter::new()));
+        self.fx.push(Box::new(fx::builtin::CursorTrail::new()));
+        self.fx.push(Box::new(fx::builtin::Fireworks::new()));
+        self.fx.push(Box::new(fx::builtin::WaitPulse::new()));
+        self.fx.push(Box::new(fx::builtin::Confetti::new()));
+        self.fx.push(Box::new(fx::builtin::OutputRain::new()));
         self.fx.push(Box::new(fx::builtin::BellFlash::new()));
-        if self.cfg.effects.process_error {
-            self.fx.push(Box::new(fx::builtin::ProcessError::new()));
+        self.fx.push(Box::new(fx::builtin::ProcessError::new()));
+        for name in config::EffectAmounts::NAMES {
+            if let Some(v) = self.cfg.effects.amounts.get(name) {
+                self.fx.set_amount(name, v);
+            }
         }
         let lua_dir = self
             .cfg
@@ -603,67 +598,152 @@ impl App {
         );
     }
 
-    fn handle_settings_click(&mut self) {
-        let (mx, my) = self.mouse_px;
+    /// Apply a settings action (mouse click or keyboard activation).
+    fn apply_settings_action(&mut self, action: &settings_ui::Action) {
         let mut needs_font_reload = false;
         let mut needs_effects = false;
+        match action {
+            settings_ui::Action::Close => {
+                self.show_settings = false;
+            }
+            settings_ui::Action::SetPage(p) => {
+                self.settings_page = *p;
+                self.settings_focus = 0;
+            }
+            settings_ui::Action::MasterAmount(_)
+            | settings_ui::Action::Amount(_, _)
+            | settings_ui::Action::AmountAuto(_) => {
+                settings_ui::apply_action(
+                    &mut self.cfg,
+                    action,
+                    self.renderer.as_ref().unwrap().font_families(),
+                );
+                needs_effects = true;
+            }
+            settings_ui::Action::FontSize(_)
+            | settings_ui::Action::FontNext
+            | settings_ui::Action::FontPrev
+            | settings_ui::Action::FontSelect(_) => {
+                settings_ui::apply_action(
+                    &mut self.cfg,
+                    action,
+                    self.renderer.as_ref().unwrap().font_families(),
+                );
+                needs_font_reload = true;
+            }
+            settings_ui::Action::FontList => self.open_font_list(),
+            settings_ui::Action::FontBack => {
+                self.settings_fonts = None;
+            }
+            settings_ui::Action::ShellNext | settings_ui::Action::Theme(_) => {
+                settings_ui::apply_action(
+                    &mut self.cfg,
+                    action,
+                    self.renderer.as_ref().unwrap().font_families(),
+                );
+            }
+        }
+        if needs_font_reload {
+            let size = self.cfg.font_size;
+            let family = self.cfg.font_family.clone();
+            if let Some(r) = &mut self.renderer {
+                r.set_font(size, family.as_deref());
+            }
+            self.resize_terminal_to_window();
+        }
+        if needs_effects {
+            self.update_effects();
+        }
+        self.dirty = true;
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn handle_settings_click(&mut self) {
+        let (mx, my) = self.mouse_px;
         for hit in &self.settings_hits {
             let (x, y, w, h) = hit.rect;
             if mx >= x && mx < x + w && my >= y && my < y + h {
-                match &hit.action {
-                    settings_ui::Action::Close => {
-                        self.show_settings = false;
-                    }
-                    settings_ui::Action::Intensity(_) | settings_ui::Action::Toggle(_) => {
-                        settings_ui::apply_action(
-                            &mut self.cfg,
-                            &hit.action,
-                            self.renderer.as_ref().unwrap().font_families(),
-                        );
-                        needs_effects = true;
-                    }
-                    settings_ui::Action::FontSize(_)
-                    | settings_ui::Action::FontNext
-                    | settings_ui::Action::FontPrev
-                    | settings_ui::Action::FontSelect(_) => {
-                        settings_ui::apply_action(
-                            &mut self.cfg,
-                            &hit.action,
-                            self.renderer.as_ref().unwrap().font_families(),
-                        );
-                        needs_font_reload = true;
-                    }
-                    settings_ui::Action::FontList => self.open_font_list(),
-                    settings_ui::Action::FontBack => {
-                        self.settings_fonts = None;
-                    }
-                    settings_ui::Action::ShellNext | settings_ui::Action::Theme(_) => {
-                        settings_ui::apply_action(
-                            &mut self.cfg,
-                            &hit.action,
-                            self.renderer.as_ref().unwrap().font_families(),
-                        );
-                    }
-                }
-                if needs_font_reload {
-                    let size = self.cfg.font_size;
-                    let family = self.cfg.font_family.clone();
-                    if let Some(r) = &mut self.renderer {
-                        r.set_font(size, family.as_deref());
-                    }
-                    self.resize_terminal_to_window();
-                }
-                if needs_effects {
-                    self.update_effects();
-                }
-                self.dirty = true;
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.settings_focus = hit.row;
+                let action = hit.action;
+                self.apply_settings_action(&action);
                 break;
             }
         }
         self.sync_ime();
+    }
+
+    /// Keyboard navigation inside the settings overlay. Returns true when the
+    /// key was consumed.
+    fn handle_settings_key(&mut self, event: &KeyEvent) -> bool {
+        let max_row = self.settings_hits.iter().map(|h| h.row).max().unwrap_or(0);
+        let mut moved = false;
+        match &event.logical_key {
+            Key::Named(NamedKey::ArrowUp) => {
+                self.settings_focus = self.settings_focus.saturating_sub(1);
+                moved = true;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.settings_focus = (self.settings_focus + 1).min(max_row);
+                moved = true;
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.settings_page = match self.settings_page {
+                    settings_ui::Page::General => settings_ui::Page::Effects,
+                    settings_ui::Page::Effects => settings_ui::Page::General,
+                };
+                self.settings_focus = 0;
+                moved = true;
+            }
+            _ => {}
+        }
+        if moved {
+            self.dirty = true;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return true;
+        }
+        let dir: i8 = match &event.logical_key {
+            Key::Named(NamedKey::ArrowLeft) => -1,
+            Key::Named(NamedKey::ArrowRight) => 1,
+            Key::Named(NamedKey::Enter | NamedKey::Space) => 0,
+            Key::Character(c) if c == " " => 0,
+            _ => return false,
+        };
+        // Pick a hit in the focused row: Left/Right prefer dir-matched hits,
+        // Enter/Space prefer dir==0; fall back to the row's first hit.
+        let mut row_hits: Vec<&settings_ui::Hit> = self
+            .settings_hits
+            .iter()
+            .filter(|h| h.row == self.settings_focus)
+            .collect();
+        row_hits.sort_by(|a, b| a.rect.0.partial_cmp(&b.rect.0).unwrap());
+        if row_hits.is_empty() {
+            return true;
+        }
+        let pick = if dir < 0 {
+            row_hits
+                .iter()
+                .find(|h| h.dir < 0)
+                .or_else(|| row_hits.first())
+        } else if dir > 0 {
+            row_hits
+                .iter()
+                .find(|h| h.dir > 0)
+                .or_else(|| row_hits.last())
+        } else {
+            row_hits
+                .iter()
+                .find(|h| h.dir == 0)
+                .or_else(|| row_hits.first())
+        };
+        if let Some(hit) = pick {
+            let action = hit.action;
+            self.apply_settings_action(&action);
+        }
+        true
     }
 
     fn handle_term_event(&mut self, ev: Event, el: &ActiveEventLoop) {
@@ -1700,6 +1780,8 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
+                    } else {
+                        self.handle_settings_key(&event);
                     }
                     return;
                 }
