@@ -12,8 +12,9 @@ pub struct Config {
     pub shell: Option<String>,
     /// Shell arguments.
     pub shell_args: Vec<String>,
-    /// Global effect intensity: off | low | normal | max.
-    pub intensity: Intensity,
+    /// Global effect amount 0.0–1.0. Per-effect `amounts` entries override it;
+    /// unset entries inherit this value. 0.0 disables effects.
+    pub amount: f32,
     /// Background color as #RRGGBB.
     pub background: String,
     /// Foreground color as #RRGGBB.
@@ -24,56 +25,97 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct EffectsCfg {
-    pub sparks: bool,
-    pub shatter: bool,
-    pub cursor_trail: bool,
-    /// Fireworks when a command appears to finish (heuristic).
-    pub fireworks: bool,
-    /// Pulsing indicator while the terminal waits for input.
-    pub wait_pulse: bool,
-    /// Confetti launched from the bottom edge on Enter.
-    pub confetti: bool,
-    /// Shooting stars triggered by PTY output.
-    pub output_rain: bool,
-    /// Massive detonation when a child process exits with a non-zero status.
-    pub process_error: bool,
+    /// Per-effect amount multipliers. `None` = inherit `Config::amount`,
+    /// `Some(0.0)` = disabled.
+    pub amounts: EffectAmounts,
     /// Directory containing *.lua effect scripts. Default: <config dir>/effects
     pub lua_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Intensity {
-    Off,
-    Low,
-    #[default]
-    Normal,
-    Max,
+/// Per-effect overrides. `None` inherits the global amount.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EffectAmounts {
+    pub sparks: Option<f32>,
+    pub shatter: Option<f32>,
+    pub cursor_trail: Option<f32>,
+    pub fireworks: Option<f32>,
+    pub wait_pulse: Option<f32>,
+    pub confetti: Option<f32>,
+    pub output_rain: Option<f32>,
+    pub process_error: Option<f32>,
+    pub bell_flash: Option<f32>,
 }
 
-impl Intensity {
-    /// Particle-count / lifetime multiplier.
-    pub fn scale(self) -> f32 {
-        match self {
-            Intensity::Off => 0.0,
-            Intensity::Low => 0.4,
-            Intensity::Normal => 1.0,
-            Intensity::Max => 2.0,
+impl EffectAmounts {
+    pub const NAMES: [&'static str; 9] = [
+        "sparks",
+        "shatter",
+        "cursor_trail",
+        "fireworks",
+        "wait_pulse",
+        "confetti",
+        "output_rain",
+        "process_error",
+        "bell_flash",
+    ];
+
+    pub fn get(&self, name: &str) -> Option<f32> {
+        match name {
+            "sparks" => self.sparks,
+            "shatter" => self.shatter,
+            "cursor_trail" => self.cursor_trail,
+            "fireworks" => self.fireworks,
+            "wait_pulse" => self.wait_pulse,
+            "confetti" => self.confetti,
+            "output_rain" => self.output_rain,
+            "process_error" => self.process_error,
+            "bell_flash" => self.bell_flash,
+            _ => None,
         }
+    }
+
+    pub fn set(&mut self, name: &str, value: Option<f32>) {
+        match name {
+            "sparks" => self.sparks = value,
+            "shatter" => self.shatter = value,
+            "cursor_trail" => self.cursor_trail = value,
+            "fireworks" => self.fireworks = value,
+            "wait_pulse" => self.wait_pulse = value,
+            "confetti" => self.confetti = value,
+            "output_rain" => self.output_rain = value,
+            "process_error" => self.process_error = value,
+            "bell_flash" => self.bell_flash = value,
+            _ => {}
+        }
+    }
+
+    /// `Some(v)` applied to every field — used by --no-fx.
+    pub fn uniform(value: Option<f32>) -> Self {
+        Self {
+            sparks: value,
+            shatter: value,
+            cursor_trail: value,
+            fireworks: value,
+            wait_pulse: value,
+            confetti: value,
+            output_rain: value,
+            process_error: value,
+            bell_flash: value,
+        }
+    }
+}
+
+impl Default for EffectAmounts {
+    fn default() -> Self {
+        Self::uniform(None)
     }
 }
 
 impl Default for EffectsCfg {
     fn default() -> Self {
         Self {
-            sparks: true,
-            shatter: true,
-            cursor_trail: true,
-            fireworks: true,
-            wait_pulse: true,
-            confetti: true,
-            output_rain: true,
-            process_error: true,
+            amounts: EffectAmounts::default(),
             lua_dir: None,
         }
     }
@@ -114,7 +156,7 @@ impl Default for Config {
             font_family: None,
             shell: None,
             shell_args: Vec::new(),
-            intensity: Intensity::Normal,
+            amount: 1.0,
             background: "#1d1f21".into(),
             foreground: "#c5c8c6".into(),
             effects: EffectsCfg::default(),

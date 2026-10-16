@@ -8,6 +8,7 @@ pub mod builtin;
 pub mod lua_fx;
 
 use crate::input::KeyKind;
+use std::collections::HashMap;
 
 /// Visual shape encoded in `Instance.kind` and `Particle.kind`.
 pub const SHAPE_RECT: u32 = 0;
@@ -132,7 +133,8 @@ pub enum FxEvent {
     },
 }
 
-/// Effect plugin interface. `scale` is the global intensity multiplier.
+/// Effect plugin interface. `scale` is the effective amount (per-effect
+/// override or the global amount).
 pub trait Effect {
     fn name(&self) -> &str;
     fn on_event(&mut self, _ev: &FxEvent, _scale: f32) {}
@@ -167,37 +169,64 @@ impl Parts {
 
 pub struct Manager {
     effects: Vec<Box<dyn Effect>>,
-    scale: f32,
+    /// Global amount; used when an effect has no explicit override.
+    global: f32,
+    /// Per-effect overrides keyed by `Effect::name()`; absent = inherit global.
+    amounts: HashMap<String, f32>,
+    /// Cached effective amount per effect (override or global), same order as
+    /// `effects`. Rebuilt when global/amounts change.
+    scales: Vec<f32>,
     scratch: Vec<Instance>,
 }
 
 impl Manager {
-    pub fn new(scale: f32) -> Self {
+    pub fn new(global: f32) -> Self {
         Self {
             effects: Vec::new(),
-            scale,
+            global,
+            amounts: HashMap::new(),
+            scales: Vec::new(),
             scratch: Vec::new(),
         }
     }
 
     pub fn push(&mut self, e: Box<dyn Effect>) {
+        let amount = self.amounts.get(e.name()).copied().unwrap_or(self.global);
+        self.scales.push(amount);
         self.effects.push(e);
     }
 
     pub fn clear(&mut self) {
         self.effects.clear();
+        self.amounts.clear();
+        self.scales.clear();
     }
 
-    pub fn set_scale(&mut self, scale: f32) {
-        self.scale = scale;
+    pub fn set_global(&mut self, global: f32) {
+        self.global = global;
+        self.rebuild_scales();
+    }
+
+    /// Set a per-effect override. Effects without an override use `global`.
+    pub fn set_amount(&mut self, name: &str, amount: f32) {
+        self.amounts.insert(name.to_string(), amount);
+        self.rebuild_scales();
+    }
+
+    fn rebuild_scales(&mut self) {
+        self.scales.clear();
+        for e in &self.effects {
+            self.scales
+                .push(self.amounts.get(e.name()).copied().unwrap_or(self.global));
+        }
     }
 
     pub fn event(&mut self, ev: &FxEvent) {
-        if self.scale <= 0.0 {
-            return;
-        }
-        for e in &mut self.effects {
-            e.on_event(ev, self.scale);
+        for (i, e) in self.effects.iter_mut().enumerate() {
+            let s = self.scales[i];
+            if s > 0.0 {
+                e.on_event(ev, s);
+            }
         }
     }
 
