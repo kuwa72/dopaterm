@@ -63,6 +63,26 @@ fn overdrive(scale: f32) -> f32 {
     ((scale - 0.8) / 0.2).clamp(0.0, 1.0)
 }
 
+/// Visible intensity stage for the 10-step dial (0 = off). Every 0.2 unlocks
+/// one more layer, so 0.1..0.9 is not just "fewer of the same particles".
+fn stage(scale: f32) -> u8 {
+    match scale {
+        s if s <= 0.0 => 0,
+        s if s < 0.3 => 1,
+        s if s < 0.5 => 2,
+        s if s < 0.7 => 3,
+        s if s < 0.9 => 4,
+        _ => 5,
+    }
+}
+
+/// Particle density curve. It spreads the ten steps apart and ramps harder at
+/// the top, so each 0.1 is visible instead of a linear "slightly more".
+fn density(scale: f32) -> f32 {
+    let s = scale.clamp(0.0, 1.0);
+    s * (0.75 + 0.65 * s)
+}
+
 fn key_color(ch: Option<char>) -> [f32; 4] {
     match ch {
         Some(c) if c.is_ascii_digit() => [0.35, 0.95, 1.0, 1.0],
@@ -202,7 +222,7 @@ fn spawn_combo_burst(parts: &mut Parts, rng: &mut u64, x: f32, y: f32, combo: u3
         drag: 0.0,
         spin: false,
     });
-    let n = (7.0 * scale).round().max(2.0) as usize;
+    let n = (7.0 * density(scale)).round().max(2.0) as usize;
     for i in 0..n {
         let a = i as f32 * std::f32::consts::TAU / n as f32 + spread(rng, 0.2);
         let v = 130.0 + rand(rng) * 60.0;
@@ -268,7 +288,8 @@ impl Effect for Sparks {
             KeyKind::Other => [0.75, 0.75, 0.85, 1.0],
         };
         let od = overdrive(scale);
-        let n = ((18.0 + 8.0 * od) * scale).round() as usize;
+        let st = stage(scale);
+        let n = ((18.0 + 8.0 * od) * density(scale)).round() as usize;
         for _ in 0..n {
             let life = 0.18 + rand(&mut self.rng) * 0.28;
             spawn_spark(
@@ -291,14 +312,18 @@ impl Effect for Sparks {
             ay: 0.0,
             life: 0.28 * scale.max(0.4),
             max_life: 0.28 * scale.max(0.4),
-            size: 8.0 + scale * 6.0 + od * 4.0,
+            size: 8.0 + density(scale) * 6.0 + od * 4.0,
             color: [color[0], color[1], color[2], 0.9],
             kind: SHAPE_RING,
             drag: 0.0,
             spin: false,
         });
-        // Overdrive rewards every 10 keys; lower amounts only at 25/50.
-        let step = if od > 0.5 { 10 } else { 25 };
+        // Milestones get closer as the dial rises: 50, then 25, then 10.
+        let step = match st {
+            5 => 10,
+            3 | 4 => 25,
+            _ => 50,
+        };
         if self.combo % step == 0 {
             spawn_combo_burst(&mut self.parts, &mut self.rng, *x, *y, self.combo, scale);
         }
@@ -348,7 +373,8 @@ impl Effect for Shatter {
         else {
             return;
         };
-        let n = (38.0 * scale).round() as usize;
+        let n = (38.0 * density(scale)).round() as usize;
+        let st = stage(scale);
         let c = brighten(*color, 1.5);
         let shapes = [
             SHAPE_RECT,
@@ -381,35 +407,39 @@ impl Effect for Shatter {
                 spin: true,
             });
         }
-        // Shockwave ring.
-        self.parts.spawn(Particle {
-            x: *x,
-            y: *y,
-            vx: 0.0,
-            vy: 0.0,
-            ay: 0.0,
-            life: 0.35 * scale.max(0.5),
-            max_life: 0.35 * scale.max(0.5),
-            size: h.max(*w) * 1.2,
-            color: [c[0], c[1], c[2], 0.75],
-            kind: SHAPE_RING,
-            drag: 0.0,
-            spin: false,
-        });
-        // Hot sparks.
-        for _ in 0..(8.0 * scale).round() as usize {
-            let g = 0.5 + rand(&mut self.rng) * 0.4;
-            let life = 0.25 + rand(&mut self.rng) * 0.2;
-            spawn_spark(
-                &mut self.parts,
-                &mut self.rng,
-                *x,
-                *y,
-                [1.0, g, 0.2, 1.0],
-                220.0,
-                life,
-                SHAPE_GLOW,
-            );
+        // Shockwave ring from stage 2; stage 1 is just shards and sparks.
+        if st >= 2 {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.35 * scale.max(0.5),
+                max_life: 0.35 * scale.max(0.5),
+                size: h.max(*w) * 1.2,
+                color: [c[0], c[1], c[2], 0.75],
+                kind: SHAPE_RING,
+                drag: 0.0,
+                spin: false,
+            });
+        }
+        // Hot sparks unlock at stage 3.
+        if st >= 3 {
+            for _ in 0..(8.0 * density(scale)).round() as usize {
+                let g = 0.5 + rand(&mut self.rng) * 0.4;
+                let life = 0.25 + rand(&mut self.rng) * 0.2;
+                spawn_spark(
+                    &mut self.parts,
+                    &mut self.rng,
+                    *x,
+                    *y,
+                    [1.0, g, 0.2, 1.0],
+                    220.0,
+                    life,
+                    SHAPE_GLOW,
+                );
+            }
         }
     }
 
@@ -510,7 +540,7 @@ const FIREWORKS_COOLDOWN: f32 = 0.18;
 pub struct Fireworks {
     parts: Parts,
     rng: u64,
-    /// Pending bursts: (fuse_seconds, x, y, color, accent, overdrive).
+    /// Pending bursts: (fuse_seconds, x, y, color, accent, scale).
     pending: Vec<(f32, f32, f32, [f32; 4], [f32; 4], f32)>,
     /// Seconds until the next volley is accepted.
     cooldown: f32,
@@ -540,10 +570,15 @@ impl Effect for Fireworks {
             return;
         }
         self.cooldown = FIREWORKS_COOLDOWN;
-        let od = overdrive(scale);
-        // Command completion is routine, so it gets a smaller volley than the
-        // once-in-a-while error shower; overdrive adds two more rockets.
-        let n = ((4.0 + 2.0 * od) * scale).round().max(1.0) as usize;
+        let st = stage(scale);
+        // One rocket per stage, then a final jump at the top of the dial.
+        let n = match st {
+            0 | 1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            _ => 5,
+        };
         for i in 0..n {
             let (color, accent) = palette_pair(&mut self.rng);
             let tx = x + spread(&mut self.rng, 280.0);
@@ -575,7 +610,7 @@ impl Effect for Fireworks {
                 [1.0, 0.97, 0.85, 0.7],
                 10,
             );
-            self.pending.push((fuse, tx, ty, color, accent, od));
+            self.pending.push((fuse, tx, ty, color, accent, scale));
         }
     }
 
@@ -592,70 +627,79 @@ impl Effect for Fireworks {
                 true
             }
         });
-        for (bx, by, color, accent, od) in bursts {
+        for (bx, by, color, accent, scale) in bursts {
+            let od = overdrive(scale);
+            let st = stage(scale);
+            let dens = density(scale);
             let phase = rand(&mut self.rng) * std::f32::consts::TAU;
-            // Outer shell: evenly spaced diamonds with white-hot cores.
+            // Outer shell: evenly spaced diamonds; cores unlock at stage 4.
             spawn_ring(
                 &mut self.parts,
                 &mut self.rng,
                 bx,
                 by,
                 &Ring {
-                    n: (26.0 + 8.0 * od).round() as usize,
+                    n: ((14.0 + 2.0 * st as f32) * dens).round().max(4.0) as usize,
                     speed: 220.0,
                     life: 0.9,
                     size: 5.2,
                     kind: SHAPE_DIAMOND,
                     color,
                     phase,
-                    core: true,
+                    core: st >= 4,
                 },
             );
-            // Inner shell: slower stars in the opposite tone, half a step off.
-            spawn_ring(
-                &mut self.parts,
-                &mut self.rng,
-                bx,
-                by,
-                &Ring {
-                    n: (16.0 + 6.0 * od).round() as usize,
-                    speed: 125.0,
-                    life: 1.05,
-                    size: 4.2,
-                    kind: SHAPE_STAR,
-                    color: with_alpha(accent, 0.78),
-                    phase: std::f32::consts::PI / 16.0,
-                    core: false,
-                },
-            );
-            // Concussive flash at the burst point; overdrive widens it.
-            self.parts.spawn(Particle {
-                x: bx,
-                y: by,
-                vx: 0.0,
-                vy: 0.0,
-                ay: 0.0,
-                life: 0.26,
-                max_life: 0.26,
-                size: 34.0 + 12.0 * od,
-                color: [1.0, 1.0, 1.0, 0.55 + 0.15 * od],
-                kind: SHAPE_RING,
-                drag: 0.0,
-                spin: false,
-            });
-            // Glitter dust for depth.
-            spawn_burst(
-                &mut self.parts,
-                &mut self.rng,
-                bx,
-                by,
-                (14.0 + 6.0 * od).round() as usize,
-                brighten(color, 1.25),
-                85.0,
-                0.55,
-            );
-            // Secondary micro-burst for extra glitter.
-            if od > 0.0 || rand(&mut self.rng) < 0.65 {
+            // Inner shell: stage 3 adds the slower opposite-tone stars.
+            if st >= 3 {
+                spawn_ring(
+                    &mut self.parts,
+                    &mut self.rng,
+                    bx,
+                    by,
+                    &Ring {
+                        n: ((8.0 + 2.0 * st as f32) * dens).round().max(2.0) as usize,
+                        speed: 125.0,
+                        life: 1.05,
+                        size: 4.2,
+                        kind: SHAPE_STAR,
+                        color: with_alpha(accent, 0.78),
+                        phase: std::f32::consts::PI / 16.0,
+                        core: false,
+                    },
+                );
+            }
+            // Concussive flash at the burst point; stage 2 and up.
+            if st >= 2 {
+                self.parts.spawn(Particle {
+                    x: bx,
+                    y: by,
+                    vx: 0.0,
+                    vy: 0.0,
+                    ay: 0.0,
+                    life: 0.26,
+                    max_life: 0.26,
+                    size: 34.0 + 12.0 * od,
+                    color: [1.0, 1.0, 1.0, 0.55 + 0.15 * od],
+                    kind: SHAPE_RING,
+                    drag: 0.0,
+                    spin: false,
+                });
+            }
+            // Glitter dust for depth; stage 2 and up.
+            if st >= 2 {
+                spawn_burst(
+                    &mut self.parts,
+                    &mut self.rng,
+                    bx,
+                    by,
+                    ((6.0 + 2.0 * st as f32) * dens).round().max(2.0) as usize,
+                    brighten(color, 1.25),
+                    85.0,
+                    0.55,
+                );
+            }
+            // Secondary micro-burst arrives at stage 4.
+            if st >= 4 {
                 let mx = bx + spread(&mut self.rng, 45.0);
                 let my = by + spread(&mut self.rng, 45.0);
                 spawn_burst(
@@ -663,7 +707,7 @@ impl Effect for Fireworks {
                     &mut self.rng,
                     mx,
                     my,
-                    (18.0 + 8.0 * od).round() as usize,
+                    ((10.0 + 3.0 * st as f32) * dens).round().max(2.0) as usize,
                     brighten(accent, 1.2),
                     95.0,
                     0.45,
@@ -730,6 +774,7 @@ impl Effect for Confetti {
         self.cooldown = CONFETTI_COOLDOWN;
         let (color, accent) = palette_pair(&mut self.rng);
         let od = overdrive(scale);
+        let st = stage(scale);
         // Impact: a small white-hot point plus a crisp shockwave ring. A big
         // soft glow here just reads as a blurry circle over the text.
         self.parts.spawn(Particle {
@@ -746,8 +791,14 @@ impl Effect for Confetti {
             drag: 0.0,
             spin: false,
         });
-        // Two crisp shockwave rings instead of one thick donut.
-        for (size, alpha, life) in [(58.0, 0.95, 0.22), (128.0, 0.35, 0.3)] {
+        // Crisp shockwave rings instead of one thick donut; the wide one only
+        // appears from stage 2 so low amounts stay local.
+        let waves: &[(f32, f32, f32)] = if st >= 2 {
+            &[(58.0, 0.95, 0.22), (128.0, 0.35, 0.3)]
+        } else {
+            &[(58.0, 0.95, 0.22)]
+        };
+        for (size, alpha, life) in waves {
             self.parts.spawn(Particle {
                 x: *x,
                 y: *y,
@@ -756,8 +807,8 @@ impl Effect for Confetti {
                 ay: 0.0,
                 life: life * scale.max(0.5),
                 max_life: life * scale.max(0.5),
-                size,
-                color: [color[0], color[1], color[2], alpha],
+                size: *size,
+                color: [color[0], color[1], color[2], *alpha],
                 kind: SHAPE_RING,
                 drag: 0.0,
                 spin: false,
@@ -765,38 +816,40 @@ impl Effect for Confetti {
         }
         // Crosshair beam: a thin vertical laser from the top edge through the
         // cursor, crossed by a fainter horizontal line on the cursor row.
-        self.parts.spawn(Particle {
-            x: *x,
-            y: *y * 0.5,
-            vx: 0.0,
-            vy: 0.0,
-            ay: 0.0,
-            life: 0.22 * scale.max(0.5),
-            max_life: 0.22 * scale.max(0.5),
-            size: *y,
-            color: [color[0], color[1], color[2], 0.85],
-            kind: SHAPE_BEAM,
-            drag: 0.0,
-            spin: false,
-        });
-        self.parts.spawn(Particle {
-            x: *w * 0.5,
-            y: *y,
-            vx: 0.0,
-            // `Particle` derives rotation from velocity; a hair of downward
-            // velocity turns the beam 90° without visibly moving it.
-            vy: 1.0,
-            ay: 0.0,
-            life: 0.12 * scale.max(0.5),
-            max_life: 0.12 * scale.max(0.5),
-            size: *w * 0.6,
-            color: [accent[0], accent[1], accent[2], 0.35],
-            kind: SHAPE_BEAM,
-            drag: 0.0,
-            spin: true,
-        });
-        // Primary ring: fast stars, each with a white-hot core.
-        let n = ((26.0 + 10.0 * od) * scale).round().max(8.0) as usize;
+        if st >= 4 {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y * 0.5,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.22 * scale.max(0.5),
+                max_life: 0.22 * scale.max(0.5),
+                size: *y,
+                color: [color[0], color[1], color[2], 0.85],
+                kind: SHAPE_BEAM,
+                drag: 0.0,
+                spin: false,
+            });
+            self.parts.spawn(Particle {
+                x: *w * 0.5,
+                y: *y,
+                vx: 0.0,
+                // `Particle` derives rotation from velocity; a hair of downward
+                // velocity turns the beam 90° without visibly moving it.
+                vy: 1.0,
+                ay: 0.0,
+                life: 0.12 * scale.max(0.5),
+                max_life: 0.12 * scale.max(0.5),
+                size: *w * 0.6,
+                color: [accent[0], accent[1], accent[2], 0.35],
+                kind: SHAPE_BEAM,
+                drag: 0.0,
+                spin: true,
+            });
+        }
+        // Primary ring: fast stars, white-hot cores from stage 4.
+        let n = ((26.0 + 10.0 * od) * density(scale)).round().max(4.0) as usize;
         spawn_ring(
             &mut self.parts,
             &mut self.rng,
@@ -810,29 +863,31 @@ impl Effect for Confetti {
                 kind: SHAPE_STAR,
                 color,
                 phase: 0.0,
-                core: true,
+                core: st >= 4,
             },
         );
         // Counter ring: slower diamonds, half a step off so the gap is filled.
-        spawn_ring(
-            &mut self.parts,
-            &mut self.rng,
-            *x,
-            *y,
-            &Ring {
-                n: n / 2 + 5,
-                speed: 150.0,
-                life: 0.95,
-                size: 4.6,
-                kind: SHAPE_DIAMOND,
-                color: with_alpha(accent, 0.85),
-                phase: std::f32::consts::PI / n as f32,
-                core: false,
-            },
-        );
+        if st >= 2 {
+            spawn_ring(
+                &mut self.parts,
+                &mut self.rng,
+                *x,
+                *y,
+                &Ring {
+                    n: n / 2 + 5,
+                    speed: 150.0,
+                    life: 0.95,
+                    size: 4.6,
+                    kind: SHAPE_DIAMOND,
+                    color: with_alpha(accent, 0.85),
+                    phase: std::f32::consts::PI / n as f32,
+                    core: false,
+                },
+            );
+        }
         // Overdrive: a third, slower star shell between the two rings.
         if od > 0.0 {
-            let m = (12.0 * od * scale).round().max(1.0) as usize;
+            let m = (12.0 * od * density(scale)).round().max(1.0) as usize;
             spawn_ring(
                 &mut self.parts,
                 &mut self.rng,
@@ -851,14 +906,16 @@ impl Effect for Confetti {
             );
         }
         // A second wave a beat later keeps the card from ending abruptly.
-        self.pending.push((0.18, *x, *y, scale, accent));
+        if st >= 3 {
+            self.pending.push((0.18, *x, *y, scale, accent));
+        }
         if od > 0.5 {
             // Overdrive only: a later echo in the primary tone.
             self.pending.push((0.34, *x, *y, scale, color));
         }
         // A few petals around the cursor, not a curtain across the whole
         // screen: Enter is a routine action and must not bury the text.
-        let n = ((16.0 + 8.0 * od) * scale).round() as usize;
+        let n = ((16.0 + 8.0 * od) * density(scale)).round() as usize;
         let shapes = [SHAPE_RECT, SHAPE_STAR, SHAPE_DIAMOND, SHAPE_DIAMOND];
         for i in 0..n {
             let life = 0.6 + rand(&mut self.rng) * 0.5;
@@ -895,7 +952,9 @@ impl Effect for Confetti {
             }
         });
         for (wx, wy, scale, color) in waves {
-            let n = ((16.0 + 6.0 * overdrive(scale)) * scale).round().max(4.0) as usize;
+            let n = ((16.0 + 6.0 * overdrive(scale)) * density(scale))
+                .round()
+                .max(4.0) as usize;
             spawn_ring(
                 &mut self.parts,
                 &mut self.rng,
@@ -946,7 +1005,7 @@ impl Effect for CursorTrail {
         let FxEvent::CursorMoved { x, y, w, h, dx, dy } = ev else {
             return;
         };
-        let len = (dx.hypot(*dy) * 0.015).clamp(4.0, 18.0) * scale;
+        let len = (dx.hypot(*dy) * 0.015).clamp(4.0, 18.0) * density(scale);
         let vx = *dx * 8.0;
         let vy = *dy * 8.0;
         spawn_comet_tail(
@@ -959,21 +1018,23 @@ impl Effect for CursorTrail {
             [0.55, 0.9, 1.0, 0.6],
             len as usize,
         );
-        // Ghost rect at the departure cell.
-        self.parts.spawn(Particle {
-            x: *x,
-            y: *y,
-            vx: 0.0,
-            vy: 0.0,
-            ay: 0.0,
-            life: 0.18 * scale.max(0.5),
-            max_life: 0.18 * scale.max(0.5),
-            size: h.max(*w) * 1.3,
-            color: [0.55, 0.85, 1.0, 0.5],
-            kind: SHAPE_RECT,
-            drag: 0.0,
-            spin: false,
-        });
+        // Ghost rect at the departure cell; stage 2 and up.
+        if stage(scale) >= 2 {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.18 * scale.max(0.5),
+                max_life: 0.18 * scale.max(0.5),
+                size: h.max(*w) * 1.3,
+                color: [0.55, 0.85, 1.0, 0.5],
+                kind: SHAPE_RECT,
+                drag: 0.0,
+                spin: false,
+            });
+        }
     }
 
     fn update(&mut self, dt: f32) {
@@ -1024,7 +1085,7 @@ impl Effect for ScrollTrail {
         }
         let dir = if *lines > 0 { 1.0 } else { -1.0 };
         let lines = (*lines as f32).abs().min(30.0);
-        let n = ((2.0 + lines * 0.7) * scale)
+        let n = ((2.0 + lines * 0.7) * density(scale))
             .round()
             .clamp(1.0, SCROLL_MAX_STREAKS as f32) as usize;
         let len = (18.0 + lines * 0.6).min(26.0) as usize;
@@ -1107,7 +1168,8 @@ impl Effect for BellFlash {
             drag: 0.0,
             spin: false,
         });
-        for i in 0..2 {
+        let rings = if stage(scale) >= 2 { 2 } else { 1 };
+        for i in 0..rings {
             self.parts.spawn(Particle {
                 x: *x,
                 y: *y,
@@ -1123,7 +1185,7 @@ impl Effect for BellFlash {
                 spin: false,
             });
         }
-        for _ in 0..(6.0 * scale).round() as usize {
+        for _ in 0..(6.0 * density(scale)).round() as usize {
             let (vx, vy) = rand_vec(&mut self.rng, 200.0);
             self.parts.spawn(Particle {
                 x: *x,
@@ -1209,24 +1271,26 @@ impl Effect for WaitPulse {
             drag: 0.0,
             spin: false,
         });
-        for _ in 0..(5.0 * scale).round() as usize {
-            let a = rand(&mut self.rng) * std::f32::consts::TAU;
-            let r = 35.0 + rand(&mut self.rng) * 25.0;
-            let (vx, vy) = rand_vec(&mut self.rng, 18.0);
-            self.parts.spawn(Particle {
-                x: x + a.cos() * r,
-                y: y + a.sin() * r,
-                vx,
-                vy,
-                ay: 0.0,
-                life: 1.2 + rand(&mut self.rng) * 0.6,
-                max_life: 1.2 + rand(&mut self.rng) * 0.6,
-                size: 1.5 + rand(&mut self.rng) * 2.0,
-                color: hsv(&mut self.rng, 0.6, 1.0),
-                kind: SHAPE_STAR,
-                drag: 0.2,
-                spin: true,
-            });
+        if stage(scale) >= 2 {
+            for _ in 0..(5.0 * density(scale)).round() as usize {
+                let a = rand(&mut self.rng) * std::f32::consts::TAU;
+                let r = 35.0 + rand(&mut self.rng) * 25.0;
+                let (vx, vy) = rand_vec(&mut self.rng, 18.0);
+                self.parts.spawn(Particle {
+                    x: x + a.cos() * r,
+                    y: y + a.sin() * r,
+                    vx,
+                    vy,
+                    ay: 0.0,
+                    life: 1.2 + rand(&mut self.rng) * 0.6,
+                    max_life: 1.2 + rand(&mut self.rng) * 0.6,
+                    size: 1.5 + rand(&mut self.rng) * 2.0,
+                    color: hsv(&mut self.rng, 0.6, 1.0),
+                    kind: SHAPE_STAR,
+                    drag: 0.2,
+                    spin: true,
+                });
+            }
         }
     }
 
@@ -1277,7 +1341,7 @@ impl Effect for OutputRain {
         if let FxEvent::PtyOutput { n, w, h } = ev {
             // Wakeups are coalesced per frame, but their count still grows
             // with throughput; sqrt keeps a big burst from multiplying.
-            self.budget = (self.budget + (*n as f32).sqrt() * 0.10 * scale).min(4.0);
+            self.budget = (self.budget + (*n as f32).sqrt() * 0.10 * density(scale)).min(4.0);
             self.win_w = *w;
             self.win_h = *h;
         }
@@ -1355,7 +1419,7 @@ impl Effect for ProcessError {
         let cx = *x;
         let cy = *y;
         self.floor = *h + 20.0;
-        let mag = (1.0 + (*status as f32).abs() / 64.0).min(3.0) * scale;
+        let mag = (1.0 + (*status as f32).abs() / 64.0).min(3.0) * density(scale);
 
         // Hard practical light flickering at the grinder contact point.
         for _ in 0..(12.0 * mag).round() as usize {
@@ -1646,6 +1710,63 @@ mod tests {
         assert_eq!(overdrive(0.8), 0.0);
         assert!((overdrive(0.9) - 0.5).abs() < 1e-6);
         assert!((overdrive(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stages_unlock_every_two_steps() {
+        assert_eq!(stage(0.0), 0);
+        assert_eq!(stage(0.1), 1);
+        assert_eq!(stage(0.2), 1);
+        assert_eq!(stage(0.3), 2);
+        assert_eq!(stage(0.5), 3);
+        assert_eq!(stage(0.7), 4);
+        assert_eq!(stage(0.9), 5);
+        assert_eq!(stage(1.0), 5);
+    }
+
+    #[test]
+    fn density_rises_at_every_step() {
+        let vals: Vec<f32> = (1..=10).map(|i| density(i as f32 / 10.0)).collect();
+        for w in vals.windows(2) {
+            assert!(
+                w[1] - w[0] >= 0.08,
+                "each 0.1 step should be visible: {vals:?}"
+            );
+        }
+        assert!(density(1.0) > 1.3, "max should overshoot the old ceiling");
+    }
+
+    #[test]
+    fn confetti_unlocks_layers_by_stage() {
+        let mut low = Confetti::new();
+        low.on_event(&enter_event(), 0.1);
+        assert!(!low.parts.0.iter().any(|p| p.kind == SHAPE_DIAMOND));
+        assert!(!low.parts.0.iter().any(|p| p.kind == SHAPE_BEAM));
+        assert!(low.pending.is_empty());
+
+        let mut mid = Confetti::new();
+        mid.on_event(&enter_event(), 0.5);
+        assert!(mid.parts.0.iter().any(|p| p.kind == SHAPE_DIAMOND));
+        assert_eq!(mid.pending.len(), 1);
+        assert!(!mid.parts.0.iter().any(|p| p.kind == SHAPE_BEAM));
+
+        let mut high = Confetti::new();
+        high.on_event(&enter_event(), 1.0);
+        assert!(high.parts.0.iter().any(|p| p.kind == SHAPE_BEAM));
+        assert_eq!(high.pending.len(), 2);
+    }
+
+    #[test]
+    fn fireworks_add_a_rocket_per_stage() {
+        let mut low = Fireworks::new();
+        low.on_event(&command_done_event(), 0.1);
+        assert_eq!(low.pending.len(), 1);
+        let mut mid = Fireworks::new();
+        mid.on_event(&command_done_event(), 0.5);
+        assert_eq!(mid.pending.len(), 3);
+        let mut high = Fireworks::new();
+        high.on_event(&command_done_event(), 1.0);
+        assert_eq!(high.pending.len(), 5);
     }
 
     #[test]
