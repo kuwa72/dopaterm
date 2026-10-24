@@ -179,6 +179,12 @@ impl LuaEffect {
                 t.set("w", *w)?;
                 t.set("h", *h)?;
             }
+            FxEvent::Scrolled { lines, w, h } => {
+                t.set("type", "scrolled")?;
+                t.set("lines", *lines)?;
+                t.set("w", *w)?;
+                t.set("h", *h)?;
+            }
             FxEvent::Bell { x, y, w, h } => {
                 t.set("type", "bell")?;
                 t.set("x", *x)?;

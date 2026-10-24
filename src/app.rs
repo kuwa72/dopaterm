@@ -76,6 +76,12 @@ pub struct App {
     /// against the diff-based erase detection for ~200ms.
     predicted_erase: Vec<(usize, Instant)>,
     last_frame: Instant,
+    /// PTY wakeups seen since the last frame. Bursts are coalesced into a
+    /// single `PtyOutput` event so effects scale with frames, not reads.
+    pending_output: usize,
+    /// Scrollback lines moved since the last frame, coalesced into one
+    /// `Scrolled` event (positive = into history).
+    pending_scroll: i32,
     dirty: bool,
     last_cursor_px: (f32, f32),
     /// Enter was pressed; becomes `command_running` when output arrives.
@@ -147,6 +153,8 @@ impl App {
             prev_cursor: None,
             predicted_erase: Vec::new(),
             last_frame: Instant::now(),
+            pending_output: 0,
+            pending_scroll: 0,
             dirty: true,
             last_cursor_px: (0.0, 0.0),
             command_pending: false,
@@ -178,6 +186,18 @@ impl App {
         let x = point.column.0 as f32 * r.cell_w;
         let y = point.line.0.max(0) as f32 * r.cell_h;
         (x, y, r.cell_w, r.cell_h)
+    }
+
+    /// Window size in physical pixels, with a sane default before the first
+    /// frame (effects need it to span the screen).
+    fn window_px(&self) -> (f32, f32) {
+        self.window
+            .as_ref()
+            .map(|w| {
+                let s = w.inner_size();
+                (s.width as f32, s.height as f32)
+            })
+            .unwrap_or((960.0, 600.0))
     }
 
     fn build_settings_overlay(&self) -> (Vec<Instance>, Vec<Line>, Vec<settings_ui::Hit>) {
@@ -367,6 +387,7 @@ impl App {
         self.fx.push(Box::new(fx::builtin::Sparks::new()));
         self.fx.push(Box::new(fx::builtin::Shatter::new()));
         self.fx.push(Box::new(fx::builtin::CursorTrail::new()));
+        self.fx.push(Box::new(fx::builtin::ScrollTrail::new()));
         self.fx.push(Box::new(fx::builtin::Fireworks::new()));
         self.fx.push(Box::new(fx::builtin::WaitPulse::new()));
         self.fx.push(Box::new(fx::builtin::Confetti::new()));
@@ -770,15 +791,9 @@ impl App {
         let Some(term) = &self.term else { return };
         match ev {
             Event::Wakeup => {
-                let (ww, wh) = self
-                    .window
-                    .as_ref()
-                    .map(|w| {
-                        let s = w.inner_size();
-                        (s.width as f32, s.height as f32)
-                    })
-                    .unwrap_or((960.0, 600.0));
-                self.fx.event(&FxEvent::PtyOutput { n: 1, w: ww, h: wh });
+                // Coalesced per frame in `build_frame`; firing per read turns
+                // fast output into a wall of particles.
+                self.pending_output += 1;
                 let now = Instant::now();
                 self.last_output = now;
                 self.last_activity = now;
@@ -896,6 +911,20 @@ impl App {
     /// Diff the term grid against the cached snapshot, emit effect events, and
     /// rebuild only the rows that changed (`self.lines`, `self.bgs`).
     fn build_frame(&mut self) {
+        if self.pending_output > 0 {
+            let (ww, wh) = self.window_px();
+            let n = std::mem::take(&mut self.pending_output);
+            self.fx.event(&FxEvent::PtyOutput { n, w: ww, h: wh });
+        }
+        if self.pending_scroll != 0 {
+            let (ww, wh) = self.window_px();
+            let lines = std::mem::take(&mut self.pending_scroll);
+            self.fx.event(&FxEvent::Scrolled {
+                lines,
+                w: ww,
+                h: wh,
+            });
+        }
         let term = self.term.as_ref().unwrap();
         let renderer = self.renderer.as_ref().unwrap();
         let guard = term.term.lock();
@@ -946,7 +975,16 @@ impl App {
             }
             self.predicted_erase
                 .retain(|(_, at)| at.elapsed() < Duration::from_secs(1));
-            for (i, ch_, fg_) in erased {
+            // A burst of erases is a redraw, not per-character editing: keep
+            // the count bounded instead of shattering every cell. The bound
+            // follows the 10-step effect amount (and any shatter override).
+            let shatter = self
+                .cfg
+                .effects
+                .amounts
+                .get("shatter")
+                .unwrap_or(self.cfg.amount);
+            for (i, ch_, fg_) in sample_erases(erased, erase_budget(shatter)) {
                 // Skip cells already shattered by key-press prediction.
                 if self
                     .predicted_erase
@@ -969,11 +1007,13 @@ impl App {
         }
 
         // Pass 2: mark dirty rows (cell diffs, scroll, cursor in/out).
+        let mut changed_cells = 0usize;
         if self.snapshot.is_empty() {
             self.dirty_lines.iter_mut().for_each(|d| *d = true);
         } else {
             for (i, (old, new)) in self.snapshot.iter().zip(&snap).enumerate() {
                 if *old != *new {
+                    changed_cells += 1;
                     let line = i / cols;
                     if line < rows {
                         self.dirty_lines[line] = true;
@@ -981,6 +1021,9 @@ impl App {
                 }
             }
         }
+        // Big repaints (output bursts, clear, alt-screen apps) should not
+        // spray cursor-trail comets across the screen.
+        let heavy_update = is_heavy_update(scrolled, changed_cells, snap.len());
         if scrolled {
             self.dirty_lines.iter_mut().for_each(|d| *d = true);
         }
@@ -1093,9 +1136,10 @@ impl App {
 
         self.snapshot = snap;
 
-        // Cursor move events.
+        // Cursor move events. Skipped on heavy repaints: the cursor jumping
+        // because the screen scrolled is not a movement the user made.
         if let Some(prev) = self.prev_cursor {
-            if prev != cursor_point {
+            if !heavy_update && prev != cursor_point {
                 let (px, py, w, h) = self.cell_rect(prev);
                 let dx = (cursor_point.column.0 as i32 - prev.column.0 as i32) as f32 * cw;
                 let dy = (cursor_point.line.0 - prev.line.0) as f32 * ch;
@@ -1547,6 +1591,37 @@ fn snapshot_grid<E: alacritty_terminal::event::EventListener>(
     snap
 }
 
+/// Upper bound on shatter events emitted for one frame's cell changes.
+const MAX_ERASE_EVENTS: usize = 12;
+
+/// Cell impacts allowed in one frame for a given effect amount. The settings
+/// slider moves in 0.1 steps, so the budget follows it directly: 1 impact at
+/// 0.1, all 12 at 1.0, none at 0.
+fn erase_budget(amount: f32) -> usize {
+    (MAX_ERASE_EVENTS as f32 * amount.clamp(0.0, 1.0)).round() as usize
+}
+
+/// Keep every erase for normal editing; for bulk repaints, take an even
+/// spread across the changed cells. Dropping the whole frame made updates
+/// feel dead, while emitting all of them buried the text.
+fn sample_erases<T>(erased: Vec<T>, cap: usize) -> Vec<T> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    if erased.len() <= cap {
+        return erased;
+    }
+    let step = erased.len().div_ceil(cap);
+    erased.into_iter().step_by(step).collect()
+}
+
+/// True when a frame repaints a large share of the grid (scroll, clear,
+/// alt-screen redraw). Effects that decorate user actions should stay quiet
+/// there: the motion is the screen's, not the user's.
+fn is_heavy_update(scrolled: bool, changed_cells: usize, cells: usize) -> bool {
+    scrolled || changed_cells * 8 >= cells
+}
+
 /// Cells that went non-space -> space between snapshots (candidate erases).
 /// Returns (cell_index, erased_char, old_fg). Suppressed when more than a
 /// third of the grid changed (scroll/redraw storms aren't deletions).
@@ -1830,6 +1905,50 @@ mod tests {
         let old: Vec<SnapCell> = vec![cell('a')];
         let new: Vec<SnapCell> = vec![cell(' '), cell(' ')];
         assert!(find_erased(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn bulk_repaints_are_heavy_but_typing_is_not() {
+        assert!(is_heavy_update(true, 0, 1920));
+        assert!(is_heavy_update(false, 240, 1920));
+        assert!(!is_heavy_update(false, 2, 1920));
+    }
+
+    #[test]
+    fn bulk_erases_are_sampled_not_dropped() {
+        let all: Vec<usize> = (0..100).collect();
+        let kept = sample_erases(all.clone(), MAX_ERASE_EVENTS);
+        assert_eq!(kept.len(), MAX_ERASE_EVENTS);
+        assert_eq!(kept[0], 0);
+        assert_eq!(*kept.last().unwrap(), 99);
+
+        let few = sample_erases(all[..5].to_vec(), MAX_ERASE_EVENTS);
+        assert_eq!(few, all[..5]);
+        assert!(sample_erases(all, 0).is_empty());
+    }
+
+    #[test]
+    fn erase_budget_tracks_the_master_amount() {
+        assert_eq!(erase_budget(0.0), 0);
+        assert_eq!(erase_budget(0.1), 1);
+        assert_eq!(erase_budget(0.5), 6);
+        assert_eq!(erase_budget(1.0), MAX_ERASE_EVENTS);
+        // Per-effect overrides are clamped like the master slider.
+        assert_eq!(erase_budget(2.0), MAX_ERASE_EVENTS);
+    }
+
+    #[test]
+    fn a_moderate_redraw_still_shatters_a_few_cells() {
+        // 100 of 1000 cells go blank: enough to be an update, not a scroll.
+        let mut old = vec![cell(' '); 1000];
+        old[..100].fill(cell('x'));
+        let new = vec![cell(' '); 1000];
+        let erased = find_erased(&old, &new);
+        assert_eq!(erased.len(), 100);
+        assert_eq!(
+            sample_erases(erased, erase_budget(1.0)).len(),
+            MAX_ERASE_EVENTS
+        );
     }
 }
 
@@ -2200,9 +2319,19 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::PixelDelta(p) => -(p.y as f32 / 20.0).round() as i32,
                 };
                 if lines != 0 {
-                    term.term.lock().scroll_display(Scroll::Delta(lines));
-                    self.dirty = true;
-                    self.window.as_ref().unwrap().request_redraw();
+                    let moved = {
+                        let mut t = term.term.lock();
+                        let before = t.grid().display_offset() as i32;
+                        t.scroll_display(Scroll::Delta(lines));
+                        t.grid().display_offset() as i32 - before
+                    };
+                    // Only report actual movement: scrolling at either end
+                    // must not fire streaks.
+                    if moved != 0 {
+                        self.pending_scroll += moved;
+                        self.dirty = true;
+                        self.window.as_ref().unwrap().request_redraw();
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -2343,6 +2472,12 @@ impl ApplicationHandler<UserEvent> for App {
                             y: y + 340.0,
                         });
                         self.fx.event(&FxEvent::Waiting { x, y });
+                        self.fx.event(&FxEvent::Confetti {
+                            x: x + 260.0,
+                            y: y + 120.0,
+                            w: ws.width as f32,
+                            h: ws.height as f32,
+                        });
                         if std::env::var_os("DOPA_HOP_DEMO").is_some() {
                             self.start_hop();
                         }
@@ -2389,7 +2524,32 @@ impl ApplicationHandler<UserEvent> for App {
                             p.advance(&mut *arc.lock(), feed.as_bytes());
                         }
                         self.build_frame();
-                        self.fx.tick(0.05);
+                        // Advance particles so the still captures the burst
+                        // spread instead of every effect sitting at its origin.
+                        for _ in 0..27 {
+                            self.fx.tick(1.0 / 60.0);
+                        }
+                        // Scroll streaks are short-lived, so fire them after
+                        // the settle ticks; the still must catch them alive.
+                        if std::env::var_os("DOPA_SCROLL_DEMO").is_some() {
+                            let ws = self.window.as_ref().unwrap().inner_size();
+                            self.fx.event(&FxEvent::Scrolled {
+                                lines: 6,
+                                w: ws.width as f32,
+                                h: ws.height as f32,
+                            });
+                        }
+                        // Same for the Enter burst's beams, which fade first.
+                        if std::env::var_os("DOPA_ENTER_DEMO").is_some() {
+                            let (x, y) = self.last_cursor_px;
+                            let ws = self.window.as_ref().unwrap().inner_size();
+                            self.fx.event(&FxEvent::Confetti {
+                                x,
+                                y,
+                                w: ws.width as f32,
+                                h: ws.height as f32,
+                            });
+                        }
                         let fx_instances: Vec<Instance> = self.fx.instances().to_vec();
                         let w = self.window.as_ref().unwrap().inner_size();
                         let clear =

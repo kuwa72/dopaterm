@@ -48,6 +48,16 @@ pub struct Hit {
 
 const PADDING_X: f32 = 24.0;
 const PADDING_Y: f32 = 20.0;
+
+/// Rows the panel must fit, including the title/tab row and the close button.
+fn page_rows(page: Page) -> f32 {
+    match page {
+        Page::General => 8.0,
+        // title + hint + one row per effect + close
+        Page::Effects => 3.0 + EffectAmounts::NAMES.len() as f32,
+    }
+}
+
 /// Panel width in text columns (64 cells ≈ 520px at the default cell size);
 /// scales with the font/DPI so labels keep their relative positions.
 const PANEL_COLS: f32 = 64.0;
@@ -156,10 +166,7 @@ pub fn build(
         return build_font_list(cfg, ww, wh, cw, ch, fonts, scroll, focus_row);
     }
     let row_h = ch * 1.8;
-    let rows = match page {
-        Page::General => 8.0,
-        Page::Effects => 13.0,
-    };
+    let rows = page_rows(page);
     let panel_w = (cw * PANEL_COLS).min(ww);
     let panel_h = rows * row_h + PADDING_Y * 2.0;
     let px = (ww - panel_w).max(0.0) / 2.0;
@@ -782,5 +789,45 @@ mod tests {
         );
         apply_action(&mut cfg, &Action::FontNext, &[]);
         assert_eq!(cfg.font_family, None);
+    }
+
+    #[test]
+    fn effects_page_fits_inside_the_panel() {
+        let cfg = Config::default();
+        let (_, lines, hits) = build(
+            &cfg,
+            960.0,
+            600.0,
+            8.0,
+            18.0,
+            &[],
+            Page::Effects,
+            None,
+            None,
+        );
+        let row_h = 18.0 * 1.8;
+        let panel_h = page_rows(Page::Effects) * row_h + PADDING_Y * 2.0;
+        let panel_bottom = (600.0 - panel_h) / 2.0 + panel_h;
+        for line in &lines {
+            assert!(
+                line.top + row_h <= panel_bottom + 0.5,
+                "row overflows the panel: {:?} top={} bottom={} panel_bottom={}",
+                line.spans.first().map(|s| &s.text),
+                line.top,
+                line.top + row_h,
+                panel_bottom
+            );
+        }
+        for hit in &hits {
+            assert!(hit.rect.1 + hit.rect.3 <= panel_bottom + 0.5);
+        }
+        assert!(hits.iter().any(|h| matches!(h.action, Action::Close)));
+        let names = EffectAmounts::NAMES.len();
+        assert_eq!(
+            hits.iter()
+                .filter(|h| matches!(h.action, Action::Amount(..)))
+                .count(),
+            names * 2
+        );
     }
 }

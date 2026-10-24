@@ -1,8 +1,8 @@
 //! Built-in effects with danmaku / bullet-hell visual punch.
 
 use super::{
-    Effect, FxEvent, Instance, Particle, Parts, SHAPE_BOLT, SHAPE_DIAMOND, SHAPE_DISC, SHAPE_GLOW,
-    SHAPE_RECT, SHAPE_RING, SHAPE_STAR,
+    Effect, FxEvent, Instance, Particle, Parts, SHAPE_BEAM, SHAPE_BOLT, SHAPE_DIAMOND, SHAPE_DISC,
+    SHAPE_GLOW, SHAPE_RECT, SHAPE_RING, SHAPE_STAR,
 };
 use crate::input::KeyKind;
 
@@ -48,6 +48,12 @@ fn brighten(c: [f32; 4], k: f32) -> [f32; 4] {
         c[2].mul_add(k, 0.0).min(1.0),
         c[3],
     ]
+}
+
+/// Dim a color without changing its hue; secondary shells stay behind the
+/// white-hot impact in the value hierarchy.
+fn with_alpha(c: [f32; 4], a: f32) -> [f32; 4] {
+    [c[0], c[1], c[2], c[3] * a]
 }
 
 fn key_color(ch: Option<char>) -> [f32; 4] {
@@ -342,20 +348,90 @@ impl Effect for Shatter {
     }
 }
 
-const FIREWORK_COLORS: [[f32; 4]; 5] = [
+/// Saturated jewel tones for bullet-hell bursts: each shell pairs a color with
+/// its opposite (index + 3) so overlapping rings stay readable.
+const FIREWORK_COLORS: [[f32; 4]; 6] = [
     [1.0, 0.35, 0.35, 1.0],
     [0.4, 0.9, 1.0, 1.0],
     [1.0, 0.85, 0.3, 1.0],
     [0.75, 0.45, 1.0, 1.0],
     [0.45, 1.0, 0.55, 1.0],
+    [1.0, 0.35, 0.85, 1.0],
 ];
+
+/// One concentric bullet ring. Even angular spacing is what makes a burst read
+/// as a bullet-hell "spell card" instead of random scatter.
+struct Ring {
+    n: usize,
+    speed: f32,
+    life: f32,
+    size: f32,
+    kind: u32,
+    color: [f32; 4],
+    /// Angular offset; stacked rings interleave instead of overlapping.
+    phase: f32,
+    /// Draw a smaller white-hot disc on top of every painted bullet.
+    core: bool,
+}
+
+fn spawn_ring(parts: &mut Parts, rng: &mut u64, x: f32, y: f32, ring: &Ring) {
+    if ring.n == 0 {
+        return;
+    }
+    let step = std::f32::consts::TAU / ring.n as f32;
+    for i in 0..ring.n {
+        let a = ring.phase + i as f32 * step + spread(rng, step * 0.06);
+        let v = ring.speed * (0.94 + rand(rng) * 0.12);
+        let life = ring.life * (0.88 + rand(rng) * 0.24);
+        let size = ring.size * (0.85 + rand(rng) * 0.3);
+        let (vx, vy) = (a.cos() * v, a.sin() * v - v * 0.12);
+        parts.spawn(Particle {
+            x,
+            y,
+            vx,
+            vy,
+            ay: 90.0,
+            life,
+            max_life: life,
+            size,
+            color: ring.color,
+            kind: ring.kind,
+            drag: 0.45,
+            spin: true,
+        });
+        if ring.core {
+            parts.spawn(Particle {
+                x,
+                y,
+                vx,
+                vy,
+                ay: 90.0,
+                life: life * 0.7,
+                max_life: life * 0.7,
+                size: size * 0.42,
+                color: [1.0, 1.0, 1.0, 0.95],
+                kind: SHAPE_DISC,
+                drag: 0.45,
+                spin: false,
+            });
+        }
+    }
+}
+
+fn palette_pair(rng: &mut u64) -> ([f32; 4], [f32; 4]) {
+    let i = (rand(rng) * FIREWORK_COLORS.len() as f32) as usize % FIREWORK_COLORS.len();
+    (
+        FIREWORK_COLORS[i],
+        FIREWORK_COLORS[(i + 3) % FIREWORK_COLORS.len()],
+    )
+}
 
 /// Command-finished celebration: rockets rise from the cursor, then burst twice.
 pub struct Fireworks {
     parts: Parts,
     rng: u64,
-    /// Pending bursts: (fuse_seconds, x, y, color).
-    pending: Vec<(f32, f32, f32, [f32; 4])>,
+    /// Pending bursts: (fuse_seconds, x, y, color, accent).
+    pending: Vec<(f32, f32, f32, [f32; 4], [f32; 4])>,
 }
 
 impl Fireworks {
@@ -377,11 +453,11 @@ impl Effect for Fireworks {
         let FxEvent::CommandDone { x, y } = ev else {
             return;
         };
-        let n = (6.0 * scale).round().max(1.0) as usize;
+        // Command completion is routine, so it gets a smaller volley than the
+        // once-in-a-while error shower; the full ring pattern still reads.
+        let n = (4.0 * scale).round().max(1.0) as usize;
         for i in 0..n {
-            let color = FIREWORK_COLORS[(rand(&mut self.rng) * FIREWORK_COLORS.len() as f32)
-                as usize
-                % FIREWORK_COLORS.len()];
+            let (color, accent) = palette_pair(&mut self.rng);
             let tx = x + spread(&mut self.rng, 280.0);
             let ty = y - 160.0 - rand(&mut self.rng) * 220.0;
             let fuse = 0.26 + i as f32 * 0.18 + rand(&mut self.rng) * 0.12;
@@ -411,7 +487,7 @@ impl Effect for Fireworks {
                 [1.0, 0.97, 0.85, 0.7],
                 10,
             );
-            self.pending.push((fuse, tx, ty, color));
+            self.pending.push((fuse, tx, ty, color, accent));
         }
     }
 
@@ -421,24 +497,75 @@ impl Effect for Fireworks {
         self.pending.retain_mut(|p| {
             p.0 -= dt;
             if p.0 <= 0.0 {
-                bursts.push((p.1, p.2, p.3));
+                bursts.push((p.1, p.2, p.3, p.4));
                 false
             } else {
                 true
             }
         });
-        for (bx, by, color) in bursts {
+        for (bx, by, color, accent) in bursts {
+            let phase = rand(&mut self.rng) * std::f32::consts::TAU;
+            // Outer shell: evenly spaced diamonds with white-hot cores.
+            spawn_ring(
+                &mut self.parts,
+                &mut self.rng,
+                bx,
+                by,
+                &Ring {
+                    n: 26,
+                    speed: 220.0,
+                    life: 0.9,
+                    size: 5.2,
+                    kind: SHAPE_DIAMOND,
+                    color,
+                    phase,
+                    core: true,
+                },
+            );
+            // Inner shell: slower stars in the opposite tone, half a step off.
+            spawn_ring(
+                &mut self.parts,
+                &mut self.rng,
+                bx,
+                by,
+                &Ring {
+                    n: 16,
+                    speed: 125.0,
+                    life: 1.05,
+                    size: 4.2,
+                    kind: SHAPE_STAR,
+                    color: with_alpha(accent, 0.78),
+                    phase: std::f32::consts::PI / 16.0,
+                    core: false,
+                },
+            );
+            // Concussive flash at the burst point.
+            self.parts.spawn(Particle {
+                x: bx,
+                y: by,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.26,
+                max_life: 0.26,
+                size: 34.0,
+                color: [1.0, 1.0, 1.0, 0.55],
+                kind: SHAPE_RING,
+                drag: 0.0,
+                spin: false,
+            });
+            // Glitter dust for depth.
             spawn_burst(
                 &mut self.parts,
                 &mut self.rng,
                 bx,
                 by,
-                54,
-                color,
-                190.0,
-                0.75,
+                16,
+                brighten(color, 1.25),
+                85.0,
+                0.55,
             );
-            // Secondary micro-bursts for extra glitter.
+            // Secondary micro-burst for extra glitter.
             if rand(&mut self.rng) < 0.65 {
                 let mx = bx + spread(&mut self.rng, 45.0);
                 let my = by + spread(&mut self.rng, 45.0);
@@ -447,8 +574,8 @@ impl Effect for Fireworks {
                     &mut self.rng,
                     mx,
                     my,
-                    22,
-                    brighten(color, 1.2),
+                    18,
+                    brighten(accent, 1.2),
                     95.0,
                     0.45,
                 );
@@ -473,10 +600,13 @@ const CONFETTI_COLORS: [[f32; 4]; 6] = [
     [1.0, 0.6, 0.3, 1.0],
 ];
 
-/// Enter: a vertical beam, expanding rings, and paper confetti.
+/// Enter: a bullet-hell "spell card" opening — impact core, interleaved star
+/// and diamond rings, a delayed counter-wave, and paper confetti.
 pub struct Confetti {
     parts: Parts,
     rng: u64,
+    /// Pending follow-up waves: (delay_seconds, x, y, scale, color).
+    pending: Vec<(f32, f32, f32, f32, [f32; 4])>,
 }
 
 impl Confetti {
@@ -484,6 +614,7 @@ impl Confetti {
         Self {
             parts: Parts::default(),
             rng: 0x51ed270b,
+            pending: Vec::new(),
         }
     }
 }
@@ -497,53 +628,126 @@ impl Effect for Confetti {
         let FxEvent::Confetti { x, y, w, h } = ev else {
             return;
         };
-        // Vertical beam through the cursor line.
+        let (color, accent) = palette_pair(&mut self.rng);
+        // Impact: a small white-hot point plus a crisp shockwave ring. A big
+        // soft glow here just reads as a blurry circle over the text.
         self.parts.spawn(Particle {
             x: *x,
-            y: *y - *h * 0.5,
+            y: *y,
             vx: 0.0,
             vy: 0.0,
             ay: 0.0,
-            life: 0.22 * scale.max(0.5),
-            max_life: 0.22 * scale.max(0.5),
-            size: *h,
-            color: [1.0, 0.9, 0.4, 0.45],
-            kind: SHAPE_GLOW,
+            life: 0.12 * scale.max(0.5),
+            max_life: 0.12 * scale.max(0.5),
+            size: 26.0,
+            color: [1.0, 1.0, 1.0, 0.95],
+            kind: SHAPE_DISC,
             drag: 0.0,
             spin: false,
         });
-        // Expanding rings from the cursor.
-        for i in 0..3 {
+        // Two crisp shockwave rings instead of one thick donut.
+        for (size, alpha, life) in [(58.0, 0.95, 0.22), (128.0, 0.35, 0.3)] {
             self.parts.spawn(Particle {
                 x: *x,
                 y: *y,
                 vx: 0.0,
                 vy: 0.0,
                 ay: 0.0,
-                life: 0.35 + i as f32 * 0.08,
-                max_life: 0.35 + i as f32 * 0.08,
-                size: 12.0 + i as f32 * 10.0,
-                color: [1.0, 1.0, 1.0, 0.35 - i as f32 * 0.08],
+                life: life * scale.max(0.5),
+                max_life: life * scale.max(0.5),
+                size,
+                color: [color[0], color[1], color[2], alpha],
                 kind: SHAPE_RING,
                 drag: 0.0,
                 spin: false,
             });
         }
-        // Confetti from the bottom edge.
-        let n = (72.0 * scale).round() as usize;
+        // Crosshair beam: a thin vertical laser from the top edge through the
+        // cursor, crossed by a fainter horizontal line on the cursor row.
+        self.parts.spawn(Particle {
+            x: *x,
+            y: *y * 0.5,
+            vx: 0.0,
+            vy: 0.0,
+            ay: 0.0,
+            life: 0.22 * scale.max(0.5),
+            max_life: 0.22 * scale.max(0.5),
+            size: *y,
+            color: [color[0], color[1], color[2], 0.85],
+            kind: SHAPE_BEAM,
+            drag: 0.0,
+            spin: false,
+        });
+        self.parts.spawn(Particle {
+            x: *w * 0.5,
+            y: *y,
+            vx: 0.0,
+            // `Particle` derives rotation from velocity; a hair of downward
+            // velocity turns the beam 90° without visibly moving it.
+            vy: 1.0,
+            ay: 0.0,
+            life: 0.12 * scale.max(0.5),
+            max_life: 0.12 * scale.max(0.5),
+            size: *w * 0.6,
+            color: [accent[0], accent[1], accent[2], 0.35],
+            kind: SHAPE_BEAM,
+            drag: 0.0,
+            spin: true,
+        });
+        // Primary ring: fast stars, each with a white-hot core.
+        let n = (26.0 * scale).round().max(8.0) as usize;
+        spawn_ring(
+            &mut self.parts,
+            &mut self.rng,
+            *x,
+            *y,
+            &Ring {
+                n,
+                speed: 240.0,
+                life: 0.7,
+                size: 5.5,
+                kind: SHAPE_STAR,
+                color,
+                phase: 0.0,
+                core: true,
+            },
+        );
+        // Counter ring: slower diamonds, half a step off so the gap is filled.
+        spawn_ring(
+            &mut self.parts,
+            &mut self.rng,
+            *x,
+            *y,
+            &Ring {
+                n: n / 2 + 5,
+                speed: 150.0,
+                life: 0.95,
+                size: 4.6,
+                kind: SHAPE_DIAMOND,
+                color: with_alpha(accent, 0.85),
+                phase: std::f32::consts::PI / n as f32,
+                core: false,
+            },
+        );
+        // A second wave a beat later keeps the card from ending abruptly.
+        self.pending.push((0.18, *x, *y, scale, accent));
+        // A few petals around the cursor, not a curtain across the whole
+        // screen: Enter is a routine action and must not bury the text.
+        let n = (16.0 * scale).round() as usize;
         let shapes = [SHAPE_RECT, SHAPE_STAR, SHAPE_DIAMOND, SHAPE_DIAMOND];
         for i in 0..n {
-            let life = 1.0 + rand(&mut self.rng) * 1.0;
+            let life = 0.6 + rand(&mut self.rng) * 0.5;
             let kind = shapes[i % shapes.len()];
+            let px = (*x + spread(&mut self.rng, 170.0)).clamp(4.0, *w - 4.0);
             self.parts.spawn(Particle {
-                x: rand(&mut self.rng) * *w,
+                x: px,
                 y: *h + 8.0,
-                vx: spread(&mut self.rng, 120.0),
-                vy: -(700.0 + rand(&mut self.rng) * 600.0),
+                vx: spread(&mut self.rng, 90.0),
+                vy: -(520.0 + rand(&mut self.rng) * 380.0),
                 ay: 900.0,
                 life,
                 max_life: life,
-                size: 3.0 + rand(&mut self.rng) * 4.0,
+                size: 3.0 + rand(&mut self.rng) * 3.0,
                 color: CONFETTI_COLORS[i % CONFETTI_COLORS.len()],
                 kind,
                 drag: 0.25,
@@ -554,12 +758,41 @@ impl Effect for Confetti {
 
     fn update(&mut self, dt: f32) {
         self.parts.step(dt);
+        let mut waves = Vec::new();
+        self.pending.retain_mut(|p| {
+            p.0 -= dt;
+            if p.0 <= 0.0 {
+                waves.push((p.1, p.2, p.3, p.4));
+                false
+            } else {
+                true
+            }
+        });
+        for (wx, wy, scale, color) in waves {
+            let n = (16.0 * scale).round().max(4.0) as usize;
+            spawn_ring(
+                &mut self.parts,
+                &mut self.rng,
+                wx,
+                wy,
+                &Ring {
+                    n,
+                    speed: 185.0,
+                    life: 0.62,
+                    size: 4.0,
+                    kind: SHAPE_BOLT,
+                    color: with_alpha(color, 0.75),
+                    phase: std::f32::consts::PI / n as f32,
+                    core: true,
+                },
+            );
+        }
     }
     fn collect(&self, out: &mut Vec<Instance>) {
         self.parts.collect(out);
     }
     fn active(&self) -> bool {
-        self.parts.alive()
+        self.parts.alive() || !self.pending.is_empty()
     }
 }
 
@@ -615,6 +848,87 @@ impl Effect for CursorTrail {
             drag: 0.0,
             spin: false,
         });
+    }
+
+    fn update(&mut self, dt: f32) {
+        self.parts.step(dt);
+    }
+    fn collect(&self, out: &mut Vec<Instance>) {
+        self.parts.collect(out);
+    }
+    fn active(&self) -> bool {
+        self.parts.alive()
+    }
+}
+
+/// Scrollback motion: vertical speed lines in the direction the text moves.
+/// Bounded per frame and in flight so fast wheel/trackpad scrolling reads as
+/// motion instead of noise on top of the text.
+pub struct ScrollTrail {
+    parts: Parts,
+    rng: u64,
+}
+
+/// Streaks alive at once during sustained scrolling.
+const SCROLL_MAX_PARTS: usize = 240;
+/// A single frame never spawns more than this many streaks, however far the
+/// view jumped.
+const SCROLL_MAX_STREAKS: usize = 10;
+
+impl ScrollTrail {
+    pub fn new() -> Self {
+        Self {
+            parts: Parts::default(),
+            rng: 0x5eed_5c01,
+        }
+    }
+}
+
+impl Effect for ScrollTrail {
+    fn name(&self) -> &str {
+        "scroll_trail"
+    }
+
+    fn on_event(&mut self, ev: &FxEvent, scale: f32) {
+        let FxEvent::Scrolled { lines, w, h } = ev else {
+            return;
+        };
+        if *lines == 0 || self.parts.0.len() >= SCROLL_MAX_PARTS {
+            return;
+        }
+        let dir = if *lines > 0 { 1.0 } else { -1.0 };
+        let lines = (*lines as f32).abs().min(30.0);
+        let n = ((2.0 + lines * 0.7) * scale)
+            .round()
+            .clamp(1.0, SCROLL_MAX_STREAKS as f32) as usize;
+        let len = (18.0 + lines * 0.6).min(26.0) as usize;
+        for _ in 0..n {
+            // Whole streaks only: a truncated line reads as a glitch.
+            if self.parts.0.len() + len > SCROLL_MAX_PARTS {
+                return;
+            }
+            let x = rand(&mut self.rng) * *w;
+            let y = rand(&mut self.rng) * *h;
+            let gap = 4.0 + rand(&mut self.rng) * 2.0;
+            for i in 0..len {
+                let t = i as f32 / len as f32;
+                let life = (0.2 + t * 0.25) * scale.max(0.4);
+                self.parts.spawn(Particle {
+                    x: x + spread(&mut self.rng, 1.0),
+                    y: y - dir * i as f32 * gap,
+                    vx: spread(&mut self.rng, 8.0),
+                    vy: dir * 60.0,
+                    ay: 0.0,
+                    life,
+                    max_life: life,
+                    size: 6.5 * (1.0 - t * 0.35),
+                    color: [0.65, 0.9, 1.0, 0.95 * (1.0 - t * 0.55)],
+                    kind: SHAPE_GLOW,
+                    drag: 1.2,
+                    spin: false,
+                });
+            }
+        }
     }
 
     fn update(&mut self, dt: f32) {
@@ -822,6 +1136,12 @@ impl OutputRain {
     }
 }
 
+/// Shooting stars alive at once. Fast output keeps spawning, so the cap (not
+/// the event rate) is what keeps a `cat` of a large file readable.
+const RAIN_MAX_PARTS: usize = 220;
+/// Stars spawned per frame; a burst must not become a wall of streaks.
+const RAIN_MAX_SPAWNS: usize = 2;
+
 impl Effect for OutputRain {
     fn name(&self) -> &str {
         "output_rain"
@@ -829,7 +1149,9 @@ impl Effect for OutputRain {
 
     fn on_event(&mut self, ev: &FxEvent, scale: f32) {
         if let FxEvent::PtyOutput { n, w, h } = ev {
-            self.budget += *n as f32 * 0.12 * scale;
+            // Wakeups are coalesced per frame, but their count still grows
+            // with throughput; sqrt keeps a big burst from multiplying.
+            self.budget = (self.budget + (*n as f32).sqrt() * 0.10 * scale).min(4.0);
             self.win_w = *w;
             self.win_h = *h;
         }
@@ -837,7 +1159,11 @@ impl Effect for OutputRain {
 
     fn update(&mut self, dt: f32) {
         self.parts.step(dt);
-        let cap = (self.budget as usize).min(10);
+        let cap = if self.parts.0.len() >= RAIN_MAX_PARTS {
+            0
+        } else {
+            (self.budget as usize).min(RAIN_MAX_SPAWNS)
+        };
         for _ in 0..cap {
             self.budget -= 1.0;
             let y = rand(&mut self.rng) * self.win_h;
@@ -866,7 +1192,7 @@ impl Effect for OutputRain {
         self.parts.collect(out);
     }
     fn active(&self) -> bool {
-        self.parts.alive() || self.budget > 0.0
+        self.parts.alive() || self.budget >= 1.0
     }
 }
 
@@ -995,5 +1321,183 @@ impl Effect for ProcessError {
     }
     fn active(&self) -> bool {
         self.parts.alive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output_event(n: usize) -> FxEvent {
+        FxEvent::PtyOutput {
+            n,
+            w: 800.0,
+            h: 600.0,
+        }
+    }
+
+    /// Run `frames` ticks and return the peak live particle count.
+    fn rain_peak(rain: &mut OutputRain, frames: usize) -> usize {
+        let mut peak = 0;
+        for _ in 0..frames {
+            rain.update(1.0 / 60.0);
+            peak = peak.max(rain.parts.0.len());
+        }
+        peak
+    }
+
+    #[test]
+    fn output_rain_burst_stays_bounded() {
+        // A huge read burst must not become thousands of shooting stars.
+        let mut rain = OutputRain::new();
+        rain.on_event(&output_event(10_000), 1.0);
+        let peak = rain_peak(&mut rain, 180);
+        assert!(peak <= RAIN_MAX_PARTS, "rain peaked at {peak} particles");
+    }
+
+    #[test]
+    fn output_rain_spawns_a_few_stars_per_frame() {
+        let mut rain = OutputRain::new();
+        rain.on_event(&output_event(10_000), 1.0);
+        rain.update(1.0 / 60.0);
+        // Each star is the head plus its comet tail.
+        assert!(rain.parts.0.len() <= RAIN_MAX_SPAWNS * 7);
+    }
+
+    #[test]
+    fn output_rain_reacts_to_ordinary_output() {
+        let mut rain = OutputRain::new();
+        rain.on_event(&output_event(100), 1.0);
+        assert!(rain_peak(&mut rain, 5) > 0);
+    }
+
+    #[test]
+    fn sub_star_budget_does_not_keep_redrawing() {
+        let mut rain = OutputRain::new();
+        rain.on_event(&output_event(1), 1.0);
+        rain_peak(&mut rain, 120);
+        assert!(!rain.active(), "fractional budget must not animate forever");
+    }
+
+    fn enter_event() -> FxEvent {
+        FxEvent::Confetti {
+            x: 400.0,
+            y: 300.0,
+            w: 800.0,
+            h: 600.0,
+        }
+    }
+
+    #[test]
+    fn bullet_ring_is_evenly_spaced_with_hot_cores() {
+        let mut parts = Parts::default();
+        let mut rng = 7u64;
+        spawn_ring(
+            &mut parts,
+            &mut rng,
+            0.0,
+            0.0,
+            &Ring {
+                n: 12,
+                speed: 100.0,
+                life: 1.0,
+                size: 2.0,
+                kind: SHAPE_STAR,
+                color: [1.0; 4],
+                phase: 0.0,
+                core: true,
+            },
+        );
+        assert_eq!(parts.0.len(), 24, "each bullet gets a white core");
+        let sum: f32 = parts
+            .0
+            .iter()
+            .filter(|p| p.kind == SHAPE_STAR)
+            .map(|p| p.vx)
+            .sum();
+        assert!(sum.abs() < 30.0, "ring momentum should cancel, got {sum}");
+    }
+
+    #[test]
+    fn confetti_fires_a_delayed_counter_wave() {
+        let mut confetti = Confetti::new();
+        confetti.on_event(&enter_event(), 1.0);
+        confetti.update(0.019);
+        assert!(
+            !confetti.parts.0.iter().any(|p| p.kind == SHAPE_BOLT),
+            "the follow-up wave must not fire immediately"
+        );
+        for _ in 0..20 {
+            confetti.update(1.0 / 60.0);
+        }
+        assert!(
+            confetti.parts.0.iter().any(|p| p.kind == SHAPE_BOLT),
+            "the follow-up wave should fire a beat later"
+        );
+    }
+
+    #[test]
+    fn enter_burst_stays_bounded() {
+        let mut confetti = Confetti::new();
+        confetti.on_event(&enter_event(), 1.0);
+        for _ in 0..120 {
+            confetti.update(1.0 / 60.0);
+            assert!(confetti.parts.0.len() < super::super::MAX_LIVE_PARTS);
+        }
+        assert!(!confetti.active(), "burst must settle");
+    }
+
+    #[test]
+    fn enter_burst_uses_beams_not_a_giant_blur() {
+        let mut confetti = Confetti::new();
+        confetti.on_event(&enter_event(), 1.0);
+        assert!(
+            confetti.parts.0.iter().any(|p| p.kind == SHAPE_BEAM),
+            "Enter should draw a crosshair beam"
+        );
+        assert!(
+            !confetti
+                .parts
+                .0
+                .iter()
+                .any(|p| matches!(p.kind, SHAPE_GLOW | SHAPE_DISC) && p.size > 64.0),
+            "the impact flash must stay a point, not a blurry disc"
+        );
+    }
+
+    fn scroll_event(lines: i32) -> FxEvent {
+        FxEvent::Scrolled {
+            lines,
+            w: 800.0,
+            h: 600.0,
+        }
+    }
+
+    #[test]
+    fn scroll_trail_follows_the_scroll_direction() {
+        let mut down = ScrollTrail::new();
+        down.on_event(&scroll_event(3), 1.0);
+        assert!(!down.parts.0.is_empty(), "scrolling must be visible");
+        assert!(
+            down.parts.0.iter().all(|p| p.vy > 0.0),
+            "scrolling into history moves the text down"
+        );
+        let mut up = ScrollTrail::new();
+        up.on_event(&scroll_event(-3), 1.0);
+        assert!(up.parts.0.iter().all(|p| p.vy < 0.0));
+    }
+
+    #[test]
+    fn scroll_trail_is_bounded_and_settles() {
+        let mut trail = ScrollTrail::new();
+        for _ in 0..120 {
+            trail.on_event(&scroll_event(20), 1.0);
+            trail.update(1.0 / 60.0);
+            assert!(trail.parts.0.len() <= SCROLL_MAX_PARTS);
+        }
+        for _ in 0..120 {
+            trail.update(1.0 / 60.0);
+        }
+        assert!(!trail.active(), "streaks must fade after scrolling stops");
     }
 }

@@ -44,7 +44,7 @@ fn vs(v: Vin) -> Vout {
     let ndc = vec2f(pr.x / u.screen.x * 2.0 - 1.0, 1.0 - pr.y / u.screen.y * 2.0);
     var o: Vout;
     o.pos = vec4f(ndc, 0.0, 1.0);
-    o.uv = v.quad;
+    o.uv = v.quad * 2.0;
     o.color = v.color;
     o.kind = v.kind;
     return o;
@@ -60,13 +60,13 @@ fn fs(i: Vout) -> @location(0) vec4f {
         }
         case 1u, 6u: {
             // glow / soft disc
-            let d = length(i.uv) * 2.0;
+            let d = length(i.uv);
             a *= max(0.0, 1.0 - d * d);
         }
         case 2u: {
             // ring
             let d = length(i.uv);
-            a *= 1.0 - smoothstep(0.35, 0.55, abs(d - 0.55));
+            a *= 1.0 - smoothstep(0.06, 0.18, abs(d - 0.8));
         }
         case 3u: {
             // diamond
@@ -83,7 +83,8 @@ fn fs(i: Vout) -> @location(0) vec4f {
                 let fold = 5.0;
                 let sector = 2.0 * PI / fold;
                 ang = abs(fract(ang / sector + 0.5) - 0.5) * sector;
-                let tip = cos(ang) / cos(sector * 0.5);
+                // Fit the 1.236-radius star tips inside the unit quad.
+                let tip = cos(ang) / (cos(sector * 0.5) * 1.236068);
                 a *= 1.0 - smoothstep(tip * 0.82, tip, r);
             }
         }
@@ -94,6 +95,14 @@ fn fs(i: Vout) -> @location(0) vec4f {
             let zig = 0.5 * sign(u) * (abs(u) - 1.0);
             let dist = abs(v - zig);
             a *= 1.0 - smoothstep(0.08, 0.20, dist);
+        }
+        case 7u: {
+            // vertical beam: narrow hot core, soft halo, tapered ends
+            let ax = abs(i.uv.x);
+            let core = 1.0 - smoothstep(0.0, 0.02, ax);
+            let halo = (1.0 - smoothstep(0.0, 0.10, ax)) * 0.18;
+            let ends = 1.0 - smoothstep(0.75, 1.0, abs(i.uv.y));
+            a *= (core + halo) * ends;
         }
         default: {}
     }

@@ -18,6 +18,8 @@ pub const SHAPE_DIAMOND: u32 = 3;
 pub const SHAPE_STAR: u32 = 4;
 pub const SHAPE_BOLT: u32 = 5;
 pub const SHAPE_DISC: u32 = 6;
+/// Vertical beam (narrow core, soft halo, tapered ends) inside the quad.
+pub const SHAPE_BEAM: u32 = 7;
 
 /// GPU instance data for one quad. Pixel-space position.
 #[repr(C)]
@@ -26,7 +28,7 @@ pub struct Instance {
     pub pos: [f32; 2],
     pub size: [f32; 2],
     pub rot: f32,
-    /// Shape id: rect, glow, ring, diamond, star, bolt, disc.
+    /// Shape id: rect, glow, ring, diamond, star, bolt, disc, beam.
     pub kind: u32,
     pub color: [f32; 4],
 }
@@ -61,7 +63,11 @@ impl Particle {
     fn instance(&self) -> Instance {
         let t = (self.life / self.max_life).clamp(0.0, 1.0);
         let mut c = self.color;
-        c[3] *= t;
+        // Eased fade (smoothstep): hold value mid-life, release at the end,
+        // instead of a linear ramp that reads as a mechanical dimmer.
+        c[3] *= t * t * (3.0 - 2.0 * t);
+        // Slight shrink sells dissipation without a separate size curve.
+        let size = self.size * (0.75 + 0.25 * t);
         let rot = if self.spin {
             self.vy.atan2(self.vx)
         } else {
@@ -69,7 +75,7 @@ impl Particle {
         };
         Instance {
             pos: [self.x, self.y],
-            size: [self.size, self.size],
+            size: [size, size],
             rot,
             kind: self.kind,
             color: c,
@@ -111,6 +117,9 @@ pub enum FxEvent {
     /// `n` units of PTY output were consumed this frame; `w,h` is the window
     /// size in pixels so effects can rain across the full screen.
     PtyOutput { n: usize, w: f32, h: f32 },
+    /// Scrollback moved by `lines` (positive = view went into history, so the
+    /// text moves down). Coalesced per frame; `w,h` is the window size.
+    Scrolled { lines: i32, w: f32, h: f32 },
     /// Terminal bell.
     Bell { x: f32, y: f32, w: f32, h: f32 },
     /// Heuristic: Enter was followed by PTY output which then went quiet.
@@ -149,9 +158,15 @@ pub trait Effect {
 #[derive(Default)]
 pub struct Parts(pub Vec<Particle>);
 
+/// Hard cap on live particles per effect. Normal bursts fit comfortably;
+/// mass updates that would otherwise pile up thousands of quads are dropped.
+pub const MAX_LIVE_PARTS: usize = 900;
+
 impl Parts {
     pub fn spawn(&mut self, p: Particle) {
-        self.0.push(p);
+        if self.0.len() < MAX_LIVE_PARTS {
+            self.0.push(p);
+        }
     }
     pub fn step(&mut self, dt: f32) {
         self.0.retain_mut(|p| {
@@ -246,5 +261,36 @@ impl Manager {
             e.collect(&mut self.scratch);
         }
         &self.scratch
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn particle() -> Particle {
+        Particle {
+            x: 0.0,
+            y: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            ay: 0.0,
+            life: 1.0,
+            max_life: 1.0,
+            size: 1.0,
+            color: [1.0; 4],
+            kind: SHAPE_GLOW,
+            drag: 0.0,
+            spin: false,
+        }
+    }
+
+    #[test]
+    fn parts_never_exceed_the_live_cap() {
+        let mut parts = Parts::default();
+        for _ in 0..MAX_LIVE_PARTS * 3 {
+            parts.spawn(particle());
+        }
+        assert_eq!(parts.0.len(), MAX_LIVE_PARTS);
     }
 }

@@ -10,7 +10,7 @@ GPU terminal emulator with input/output visual effects, written in Rust
 ## Features
 
 - Visual effects driven by input/output events: shatter on erase, cursor
-  trail, fireworks, and more
+  trail, scrollback streaks, fireworks, and more
 - Lua effect plugins loaded from `<config dir>/dopaterm/effects/*.lua`
 - Settings overlay (`F1`): toggle effect intensity and each effect, pick a
   system monospace font at runtime
