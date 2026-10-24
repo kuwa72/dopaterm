@@ -56,6 +56,13 @@ fn with_alpha(c: [f32; 4], a: f32) -> [f32; 4] {
     [c[0], c[1], c[2], c[3] * a]
 }
 
+/// Extra spectacle that unlocks only near the top of the 10-step dial: 0 below
+/// 0.8, 1.0 at max. Adds layers (not screen coverage), following the
+/// "preserve hierarchy / never turn everything to 11" clarity guidance.
+fn overdrive(scale: f32) -> f32 {
+    ((scale - 0.8) / 0.2).clamp(0.0, 1.0)
+}
+
 fn key_color(ch: Option<char>) -> [f32; 4] {
     match ch {
         Some(c) if c.is_ascii_digit() => [0.35, 0.95, 1.0, 1.0],
@@ -172,10 +179,59 @@ fn spawn_burst(
     }
 }
 
+/// Keystrokes closer together than this keep the combo alive.
+const COMBO_WINDOW: f32 = 0.35;
+/// Quiet time after which the combo resets.
+const COMBO_RESET: f32 = 0.6;
+
+/// Milestone reward for sustained typing: a white ring plus a star spray.
+/// The color shifts with each milestone so the reward never looks identical.
+fn spawn_combo_burst(parts: &mut Parts, rng: &mut u64, x: f32, y: f32, combo: u32, scale: f32) {
+    let color = hsv(rng, 0.65, 1.0);
+    parts.spawn(Particle {
+        x,
+        y,
+        vx: 0.0,
+        vy: 0.0,
+        ay: 0.0,
+        life: 0.34 * scale.max(0.4),
+        max_life: 0.34 * scale.max(0.4),
+        size: 14.0 + (combo as f32).sqrt() * 2.0,
+        color: [1.0, 1.0, 1.0, 0.9],
+        kind: SHAPE_RING,
+        drag: 0.0,
+        spin: false,
+    });
+    let n = (7.0 * scale).round().max(2.0) as usize;
+    for i in 0..n {
+        let a = i as f32 * std::f32::consts::TAU / n as f32 + spread(rng, 0.2);
+        let v = 130.0 + rand(rng) * 60.0;
+        let life = 0.3 + rand(rng) * 0.15;
+        parts.spawn(Particle {
+            x,
+            y,
+            vx: a.cos() * v,
+            vy: a.sin() * v - 40.0,
+            ay: 220.0,
+            life,
+            max_life: life,
+            size: 2.5 + rand(rng) * 2.0,
+            color,
+            kind: SHAPE_STAR,
+            drag: 1.0,
+            spin: true,
+        });
+    }
+}
+
 /// Keystroke: colored sparks plus an expanding ring keyed by the typed character.
 pub struct Sparks {
     parts: Parts,
     rng: u64,
+    /// Consecutive keystrokes; resets after a quiet beat.
+    combo: u32,
+    /// Seconds since the last keystroke.
+    idle: f32,
 }
 
 impl Sparks {
@@ -183,6 +239,8 @@ impl Sparks {
         Self {
             parts: Parts::default(),
             rng: 0x9e3779b97f4a7c15,
+            combo: 0,
+            idle: COMBO_RESET,
         }
     }
 }
@@ -196,6 +254,12 @@ impl Effect for Sparks {
         let FxEvent::Key { kind, ch, x, y } = ev else {
             return;
         };
+        self.combo = if self.idle <= COMBO_WINDOW {
+            self.combo + 1
+        } else {
+            1
+        };
+        self.idle = 0.0;
         let color = match kind {
             KeyKind::Char => key_color(*ch),
             KeyKind::Backspace => [1.0, 0.35, 0.45, 1.0],
@@ -203,7 +267,8 @@ impl Effect for Sparks {
             KeyKind::Arrow => [0.55, 0.75, 1.0, 1.0],
             KeyKind::Other => [0.75, 0.75, 0.85, 1.0],
         };
-        let n = (18.0 * scale).round() as usize;
+        let od = overdrive(scale);
+        let n = ((18.0 + 8.0 * od) * scale).round() as usize;
         for _ in 0..n {
             let life = 0.18 + rand(&mut self.rng) * 0.28;
             spawn_spark(
@@ -226,16 +291,27 @@ impl Effect for Sparks {
             ay: 0.0,
             life: 0.28 * scale.max(0.4),
             max_life: 0.28 * scale.max(0.4),
-            size: 8.0 + scale * 6.0,
+            size: 8.0 + scale * 6.0 + od * 4.0,
             color: [color[0], color[1], color[2], 0.9],
             kind: SHAPE_RING,
             drag: 0.0,
             spin: false,
         });
+        // Overdrive rewards every 10 keys; lower amounts only at 25/50.
+        let step = if od > 0.5 { 10 } else { 25 };
+        if self.combo % step == 0 {
+            spawn_combo_burst(&mut self.parts, &mut self.rng, *x, *y, self.combo, scale);
+        }
     }
 
     fn update(&mut self, dt: f32) {
         self.parts.step(dt);
+        if self.idle < COMBO_RESET {
+            self.idle += dt;
+        }
+        if self.idle >= COMBO_RESET {
+            self.combo = 0;
+        }
     }
     fn collect(&self, out: &mut Vec<Instance>) {
         self.parts.collect(out);
@@ -426,12 +502,18 @@ fn palette_pair(rng: &mut u64) -> ([f32; 4], [f32; 4]) {
     )
 }
 
+/// Command completions closer together than this are ignored: rapid commands
+/// must not stack bursts into a flicker.
+const FIREWORKS_COOLDOWN: f32 = 0.18;
+
 /// Command-finished celebration: rockets rise from the cursor, then burst twice.
 pub struct Fireworks {
     parts: Parts,
     rng: u64,
-    /// Pending bursts: (fuse_seconds, x, y, color, accent).
-    pending: Vec<(f32, f32, f32, [f32; 4], [f32; 4])>,
+    /// Pending bursts: (fuse_seconds, x, y, color, accent, overdrive).
+    pending: Vec<(f32, f32, f32, [f32; 4], [f32; 4], f32)>,
+    /// Seconds until the next volley is accepted.
+    cooldown: f32,
 }
 
 impl Fireworks {
@@ -440,6 +522,7 @@ impl Fireworks {
             parts: Parts::default(),
             rng: 0x27d4eb2f,
             pending: Vec::new(),
+            cooldown: 0.0,
         }
     }
 }
@@ -453,9 +536,14 @@ impl Effect for Fireworks {
         let FxEvent::CommandDone { x, y } = ev else {
             return;
         };
+        if self.cooldown > 0.0 {
+            return;
+        }
+        self.cooldown = FIREWORKS_COOLDOWN;
+        let od = overdrive(scale);
         // Command completion is routine, so it gets a smaller volley than the
-        // once-in-a-while error shower; the full ring pattern still reads.
-        let n = (4.0 * scale).round().max(1.0) as usize;
+        // once-in-a-while error shower; overdrive adds two more rockets.
+        let n = ((4.0 + 2.0 * od) * scale).round().max(1.0) as usize;
         for i in 0..n {
             let (color, accent) = palette_pair(&mut self.rng);
             let tx = x + spread(&mut self.rng, 280.0);
@@ -487,23 +575,24 @@ impl Effect for Fireworks {
                 [1.0, 0.97, 0.85, 0.7],
                 10,
             );
-            self.pending.push((fuse, tx, ty, color, accent));
+            self.pending.push((fuse, tx, ty, color, accent, od));
         }
     }
 
     fn update(&mut self, dt: f32) {
+        self.cooldown = (self.cooldown - dt).max(0.0);
         self.parts.step(dt);
         let mut bursts = Vec::new();
         self.pending.retain_mut(|p| {
             p.0 -= dt;
             if p.0 <= 0.0 {
-                bursts.push((p.1, p.2, p.3, p.4));
+                bursts.push((p.1, p.2, p.3, p.4, p.5));
                 false
             } else {
                 true
             }
         });
-        for (bx, by, color, accent) in bursts {
+        for (bx, by, color, accent, od) in bursts {
             let phase = rand(&mut self.rng) * std::f32::consts::TAU;
             // Outer shell: evenly spaced diamonds with white-hot cores.
             spawn_ring(
@@ -512,7 +601,7 @@ impl Effect for Fireworks {
                 bx,
                 by,
                 &Ring {
-                    n: 26,
+                    n: (26.0 + 8.0 * od).round() as usize,
                     speed: 220.0,
                     life: 0.9,
                     size: 5.2,
@@ -529,7 +618,7 @@ impl Effect for Fireworks {
                 bx,
                 by,
                 &Ring {
-                    n: 16,
+                    n: (16.0 + 6.0 * od).round() as usize,
                     speed: 125.0,
                     life: 1.05,
                     size: 4.2,
@@ -539,7 +628,7 @@ impl Effect for Fireworks {
                     core: false,
                 },
             );
-            // Concussive flash at the burst point.
+            // Concussive flash at the burst point; overdrive widens it.
             self.parts.spawn(Particle {
                 x: bx,
                 y: by,
@@ -548,8 +637,8 @@ impl Effect for Fireworks {
                 ay: 0.0,
                 life: 0.26,
                 max_life: 0.26,
-                size: 34.0,
-                color: [1.0, 1.0, 1.0, 0.55],
+                size: 34.0 + 12.0 * od,
+                color: [1.0, 1.0, 1.0, 0.55 + 0.15 * od],
                 kind: SHAPE_RING,
                 drag: 0.0,
                 spin: false,
@@ -560,13 +649,13 @@ impl Effect for Fireworks {
                 &mut self.rng,
                 bx,
                 by,
-                16,
+                (14.0 + 6.0 * od).round() as usize,
                 brighten(color, 1.25),
                 85.0,
                 0.55,
             );
             // Secondary micro-burst for extra glitter.
-            if rand(&mut self.rng) < 0.65 {
+            if od > 0.0 || rand(&mut self.rng) < 0.65 {
                 let mx = bx + spread(&mut self.rng, 45.0);
                 let my = by + spread(&mut self.rng, 45.0);
                 spawn_burst(
@@ -574,7 +663,7 @@ impl Effect for Fireworks {
                     &mut self.rng,
                     mx,
                     my,
-                    18,
+                    (18.0 + 8.0 * od).round() as usize,
                     brighten(accent, 1.2),
                     95.0,
                     0.45,
@@ -587,7 +676,7 @@ impl Effect for Fireworks {
         self.parts.collect(out);
     }
     fn active(&self) -> bool {
-        self.parts.alive() || !self.pending.is_empty()
+        self.parts.alive() || !self.pending.is_empty() || self.cooldown > 0.0
     }
 }
 
@@ -600,6 +689,10 @@ const CONFETTI_COLORS: [[f32; 4]; 6] = [
     [1.0, 0.6, 0.3, 1.0],
 ];
 
+/// Enter bursts closer together than this are ignored: rapid repeats must not
+/// stack into a flicker, and each burst needs a beat to read.
+const CONFETTI_COOLDOWN: f32 = 0.12;
+
 /// Enter: a bullet-hell "spell card" opening — impact core, interleaved star
 /// and diamond rings, a delayed counter-wave, and paper confetti.
 pub struct Confetti {
@@ -607,6 +700,8 @@ pub struct Confetti {
     rng: u64,
     /// Pending follow-up waves: (delay_seconds, x, y, scale, color).
     pending: Vec<(f32, f32, f32, f32, [f32; 4])>,
+    /// Seconds until the next burst is accepted.
+    cooldown: f32,
 }
 
 impl Confetti {
@@ -615,6 +710,7 @@ impl Confetti {
             parts: Parts::default(),
             rng: 0x51ed270b,
             pending: Vec::new(),
+            cooldown: 0.0,
         }
     }
 }
@@ -628,7 +724,12 @@ impl Effect for Confetti {
         let FxEvent::Confetti { x, y, w, h } = ev else {
             return;
         };
+        if self.cooldown > 0.0 {
+            return;
+        }
+        self.cooldown = CONFETTI_COOLDOWN;
         let (color, accent) = palette_pair(&mut self.rng);
+        let od = overdrive(scale);
         // Impact: a small white-hot point plus a crisp shockwave ring. A big
         // soft glow here just reads as a blurry circle over the text.
         self.parts.spawn(Particle {
@@ -695,7 +796,7 @@ impl Effect for Confetti {
             spin: true,
         });
         // Primary ring: fast stars, each with a white-hot core.
-        let n = (26.0 * scale).round().max(8.0) as usize;
+        let n = ((26.0 + 10.0 * od) * scale).round().max(8.0) as usize;
         spawn_ring(
             &mut self.parts,
             &mut self.rng,
@@ -729,11 +830,35 @@ impl Effect for Confetti {
                 core: false,
             },
         );
+        // Overdrive: a third, slower star shell between the two rings.
+        if od > 0.0 {
+            let m = (12.0 * od * scale).round().max(1.0) as usize;
+            spawn_ring(
+                &mut self.parts,
+                &mut self.rng,
+                *x,
+                *y,
+                &Ring {
+                    n: m,
+                    speed: 200.0,
+                    life: 0.6,
+                    size: 4.2,
+                    kind: SHAPE_STAR,
+                    color: with_alpha(color, 0.9),
+                    phase: std::f32::consts::PI / m as f32,
+                    core: false,
+                },
+            );
+        }
         // A second wave a beat later keeps the card from ending abruptly.
         self.pending.push((0.18, *x, *y, scale, accent));
+        if od > 0.5 {
+            // Overdrive only: a later echo in the primary tone.
+            self.pending.push((0.34, *x, *y, scale, color));
+        }
         // A few petals around the cursor, not a curtain across the whole
         // screen: Enter is a routine action and must not bury the text.
-        let n = (16.0 * scale).round() as usize;
+        let n = ((16.0 + 8.0 * od) * scale).round() as usize;
         let shapes = [SHAPE_RECT, SHAPE_STAR, SHAPE_DIAMOND, SHAPE_DIAMOND];
         for i in 0..n {
             let life = 0.6 + rand(&mut self.rng) * 0.5;
@@ -757,6 +882,7 @@ impl Effect for Confetti {
     }
 
     fn update(&mut self, dt: f32) {
+        self.cooldown = (self.cooldown - dt).max(0.0);
         self.parts.step(dt);
         let mut waves = Vec::new();
         self.pending.retain_mut(|p| {
@@ -769,7 +895,7 @@ impl Effect for Confetti {
             }
         });
         for (wx, wy, scale, color) in waves {
-            let n = (16.0 * scale).round().max(4.0) as usize;
+            let n = ((16.0 + 6.0 * overdrive(scale)) * scale).round().max(4.0) as usize;
             spawn_ring(
                 &mut self.parts,
                 &mut self.rng,
@@ -792,7 +918,7 @@ impl Effect for Confetti {
         self.parts.collect(out);
     }
     fn active(&self) -> bool {
-        self.parts.alive() || !self.pending.is_empty()
+        self.parts.alive() || !self.pending.is_empty() || self.cooldown > 0.0
     }
 }
 
@@ -1499,5 +1625,99 @@ mod tests {
             trail.update(1.0 / 60.0);
         }
         assert!(!trail.active(), "streaks must fade after scrolling stops");
+    }
+
+    fn key_event() -> FxEvent {
+        FxEvent::Key {
+            kind: KeyKind::Char,
+            ch: Some('x'),
+            x: 100.0,
+            y: 100.0,
+        }
+    }
+
+    fn command_done_event() -> FxEvent {
+        FxEvent::CommandDone { x: 200.0, y: 200.0 }
+    }
+
+    #[test]
+    fn overdrive_only_unlocks_at_the_top() {
+        assert_eq!(overdrive(0.0), 0.0);
+        assert_eq!(overdrive(0.8), 0.0);
+        assert!((overdrive(0.9) - 0.5).abs() < 1e-6);
+        assert!((overdrive(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn combo_tracks_fast_typing_and_resets_when_idle() {
+        let mut sparks = Sparks::new();
+        sparks.on_event(&key_event(), 1.0);
+        assert_eq!(sparks.combo, 1);
+        sparks.update(0.2);
+        sparks.on_event(&key_event(), 1.0);
+        assert_eq!(sparks.combo, 2);
+        sparks.update(COMBO_RESET + 0.01);
+        assert_eq!(sparks.combo, 0);
+    }
+
+    #[test]
+    fn overdrive_typing_earns_milestone_stars() {
+        let mut hot = Sparks::new();
+        for _ in 0..10 {
+            hot.on_event(&key_event(), 1.0);
+            hot.update(0.1);
+        }
+        assert!(
+            hot.parts.0.iter().any(|p| p.kind == SHAPE_STAR),
+            "max amount should celebrate every 10 keys"
+        );
+        let mut calm = Sparks::new();
+        for _ in 0..10 {
+            calm.on_event(&key_event(), 0.4);
+            calm.update(0.1);
+        }
+        assert!(
+            !calm.parts.0.iter().any(|p| p.kind == SHAPE_STAR),
+            "lower amounts only celebrate at 25/50"
+        );
+    }
+
+    #[test]
+    fn rapid_enter_bursts_wait_for_the_cooldown() {
+        let mut confetti = Confetti::new();
+        confetti.on_event(&enter_event(), 1.0);
+        let first = confetti.parts.0.len();
+        confetti.on_event(&enter_event(), 1.0);
+        assert_eq!(confetti.parts.0.len(), first, "second burst must wait");
+        confetti.update(CONFETTI_COOLDOWN + 0.01);
+        let before = confetti.parts.0.len();
+        confetti.on_event(&enter_event(), 1.0);
+        assert!(confetti.parts.0.len() > before);
+    }
+
+    #[test]
+    fn rapid_command_completions_wait_for_the_cooldown() {
+        let mut fireworks = Fireworks::new();
+        fireworks.on_event(&command_done_event(), 1.0);
+        let first = fireworks.pending.len();
+        assert!(first > 0);
+        fireworks.on_event(&command_done_event(), 1.0);
+        assert_eq!(fireworks.pending.len(), first, "second volley must wait");
+        fireworks.update(FIREWORKS_COOLDOWN + 0.01);
+        fireworks.on_event(&command_done_event(), 1.0);
+        assert_eq!(fireworks.pending.len(), first * 2);
+    }
+
+    #[test]
+    fn max_amount_adds_layers_without_covering_more_screen() {
+        let mut hot = Confetti::new();
+        hot.on_event(&enter_event(), 1.0);
+        let mut calm = Confetti::new();
+        calm.on_event(&enter_event(), 0.8);
+        let stars = |c: &Confetti| c.parts.0.iter().filter(|p| p.kind == SHAPE_STAR).count();
+        assert!(
+            stars(&hot) > stars(&calm),
+            "overdrive must add bullet layers, not just brighten"
+        );
     }
 }
