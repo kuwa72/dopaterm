@@ -441,6 +441,56 @@ impl Effect for Shatter {
                 );
             }
         }
+        // Stage 5 is deliberately excessive: a wide second shockwave, a light
+        // pillar on the cell, and a ring of star satellites around the debris.
+        if st >= 5 {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.42 * scale.max(0.5),
+                max_life: 0.42 * scale.max(0.5),
+                size: h.max(*w) * 2.6,
+                color: [c[0], c[1], c[2], 0.35],
+                kind: SHAPE_RING,
+                drag: 0.0,
+                spin: false,
+            });
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.3 * scale.max(0.5),
+                max_life: 0.3 * scale.max(0.5),
+                size: *h * 7.0,
+                color: [c[0], c[1], c[2], 0.5],
+                kind: SHAPE_BEAM,
+                drag: 0.0,
+                spin: false,
+            });
+            for i in 0..6 {
+                let a = i as f32 * std::f32::consts::TAU / 6.0;
+                let life = 0.35 + rand(&mut self.rng) * 0.2;
+                self.parts.spawn(Particle {
+                    x: *x,
+                    y: *y,
+                    vx: a.cos() * 190.0,
+                    vy: a.sin() * 190.0 - 60.0,
+                    ay: 350.0,
+                    life,
+                    max_life: life,
+                    size: 3.0 + rand(&mut self.rng) * 1.5,
+                    color: brighten(c, 1.2),
+                    kind: SHAPE_STAR,
+                    drag: 0.9,
+                    spin: true,
+                });
+            }
+        }
     }
 
     fn update(&mut self, dt: f32) {
@@ -1312,6 +1362,8 @@ pub struct OutputRain {
     budget: f32,
     win_w: f32,
     win_h: f32,
+    /// Top-tier storm factor (0 below 0.8, 1.0 at max).
+    boost: f32,
 }
 
 impl OutputRain {
@@ -1322,6 +1374,7 @@ impl OutputRain {
             budget: 0.0,
             win_w: 960.0,
             win_h: 600.0,
+            boost: 0.0,
         }
     }
 }
@@ -1332,6 +1385,14 @@ const RAIN_MAX_PARTS: usize = 220;
 /// Stars spawned per frame; a burst must not become a wall of streaks.
 const RAIN_MAX_SPAWNS: usize = 2;
 
+fn rain_cap(boost: f32) -> usize {
+    RAIN_MAX_PARTS + (RAIN_MAX_PARTS as f32 * 0.5 * boost) as usize
+}
+
+fn rain_spawns(boost: f32) -> usize {
+    RAIN_MAX_SPAWNS + (2.0 * boost) as usize
+}
+
 impl Effect for OutputRain {
     fn name(&self) -> &str {
         "output_rain"
@@ -1339,9 +1400,11 @@ impl Effect for OutputRain {
 
     fn on_event(&mut self, ev: &FxEvent, scale: f32) {
         if let FxEvent::PtyOutput { n, w, h } = ev {
+            self.boost = overdrive(scale);
             // Wakeups are coalesced per frame, but their count still grows
             // with throughput; sqrt keeps a big burst from multiplying.
-            self.budget = (self.budget + (*n as f32).sqrt() * 0.10 * density(scale)).min(4.0);
+            self.budget = (self.budget + (*n as f32).sqrt() * 0.10 * density(scale))
+                .min(4.0 + 2.0 * self.boost);
             self.win_w = *w;
             self.win_h = *h;
         }
@@ -1349,10 +1412,10 @@ impl Effect for OutputRain {
 
     fn update(&mut self, dt: f32) {
         self.parts.step(dt);
-        let cap = if self.parts.0.len() >= RAIN_MAX_PARTS {
+        let cap = if self.parts.0.len() >= rain_cap(self.boost) {
             0
         } else {
-            (self.budget as usize).min(RAIN_MAX_SPAWNS)
+            (self.budget as usize).min(rain_spawns(self.boost))
         };
         for _ in 0..cap {
             self.budget -= 1.0;
@@ -1374,7 +1437,17 @@ impl Effect for OutputRain {
                 drag: 0.0,
                 spin: false,
             });
-            spawn_comet_tail(&mut self.parts, &mut self.rng, x, y, -speed, 0.0, color, 6);
+            let tail = 6 + (2.0 * self.boost) as usize;
+            spawn_comet_tail(
+                &mut self.parts,
+                &mut self.rng,
+                x,
+                y,
+                -speed,
+                0.0,
+                color,
+                tail,
+            );
         }
     }
 
@@ -1542,7 +1615,10 @@ mod tests {
         let mut rain = OutputRain::new();
         rain.on_event(&output_event(10_000), 1.0);
         let peak = rain_peak(&mut rain, 180);
-        assert!(peak <= RAIN_MAX_PARTS, "rain peaked at {peak} particles");
+        assert!(
+            peak <= rain_cap(1.0),
+            "max storm peaked at {peak} particles"
+        );
     }
 
     #[test]
@@ -1550,8 +1626,17 @@ mod tests {
         let mut rain = OutputRain::new();
         rain.on_event(&output_event(10_000), 1.0);
         rain.update(1.0 / 60.0);
-        // Each star is the head plus its comet tail.
-        assert!(rain.parts.0.len() <= RAIN_MAX_SPAWNS * 7);
+        // Each star is the head plus its boosted comet tail.
+        let per_star = 1 + 6 + 2;
+        assert!(rain.parts.0.len() <= rain_spawns(1.0) * per_star);
+    }
+
+    #[test]
+    fn output_rain_is_faint_at_the_bottom_of_the_dial() {
+        let mut rain = OutputRain::new();
+        rain.on_event(&output_event(10_000), 0.1);
+        let peak = rain_peak(&mut rain, 30);
+        assert!(peak <= 3, "0.1 should stay restrained, peaked at {peak}");
     }
 
     #[test]

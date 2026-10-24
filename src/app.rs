@@ -966,7 +966,16 @@ impl App {
 
         // Mass changes = scroll/redraw; suppress shatter storms.
         if !scrolled {
-            let erased = find_erased(&self.snapshot, &snap);
+            // The bound follows the 10-step effect amount (and any shatter
+            // override). At stage 5 the diff also includes in-place text
+            // replacements, so every screen update gets debris.
+            let shatter = self
+                .cfg
+                .effects
+                .amounts
+                .get("shatter")
+                .unwrap_or(self.cfg.amount);
+            let erased = find_erased(&self.snapshot, &snap, shatter >= 0.9);
             if std::env::var_os("DOPA_DEBUG").is_some() && !erased.is_empty() {
                 eprintln!(
                     "dopaterm: erased {:?}",
@@ -976,14 +985,7 @@ impl App {
             self.predicted_erase
                 .retain(|(_, at)| at.elapsed() < Duration::from_secs(1));
             // A burst of erases is a redraw, not per-character editing: keep
-            // the count bounded instead of shattering every cell. The bound
-            // follows the 10-step effect amount (and any shatter override).
-            let shatter = self
-                .cfg
-                .effects
-                .amounts
-                .get("shatter")
-                .unwrap_or(self.cfg.amount);
+            // the count bounded instead of shattering every cell.
             for (i, ch_, fg_) in sample_erases(erased, erase_budget(shatter)) {
                 // Skip cells already shattered by key-press prediction.
                 if self
@@ -1622,10 +1624,16 @@ fn is_heavy_update(scrolled: bool, changed_cells: usize, cells: usize) -> bool {
     scrolled || changed_cells * 8 >= cells
 }
 
-/// Cells that went non-space -> space between snapshots (candidate erases).
-/// Returns (cell_index, erased_char, old_fg). Suppressed when more than a
-/// third of the grid changed (scroll/redraw storms aren't deletions).
-fn find_erased(old: &[SnapCell], new: &[SnapCell]) -> Vec<(usize, char, [u8; 4])> {
+/// Cells that disappeared or changed between snapshots (candidate impacts).
+/// `include_overwrites` also returns in-place character replacements, which
+/// only unlocks at the top of the dial so ordinary updates get debris too.
+/// Returns (cell_index, old_char, old_fg). Suppressed when more than a third
+/// of the grid changed (scroll/redraw storms aren't deletions).
+fn find_erased(
+    old: &[SnapCell],
+    new: &[SnapCell],
+    include_overwrites: bool,
+) -> Vec<(usize, char, [u8; 4])> {
     if old.len() != new.len() || new.is_empty() {
         return Vec::new();
     }
@@ -1634,7 +1642,9 @@ fn find_erased(old: &[SnapCell], new: &[SnapCell]) -> Vec<(usize, char, [u8; 4])
     for (i, (o, n)) in old.iter().zip(new.iter()).enumerate() {
         if o != n {
             changed += 1;
-            if !matches!(o.0, ' ' | '\0') && matches!(n.0, ' ' | '\0') {
+            let gone = !matches!(o.0, ' ' | '\0') && matches!(n.0, ' ' | '\0');
+            let replaced = include_overwrites && !matches!(o.0, ' ' | '\0') && o.0 != n.0;
+            if gone || replaced {
                 out.push((i, o.0, o.1));
             }
         }
@@ -1850,7 +1860,7 @@ mod tests {
     fn spacer_removal_does_not_spawn_a_glyph_particle() {
         let mut old = vec![cell(' '); 12];
         old[2] = cell('\0');
-        assert!(find_erased(&old, &vec![cell(' '); 12]).is_empty());
+        assert!(find_erased(&old, &vec![cell(' '); 12], false).is_empty());
     }
 
     #[test]
@@ -1879,7 +1889,7 @@ mod tests {
         // "$ x" then x erased -> single erase at index 2.
         let old: Vec<SnapCell> = vec![cell('$'), cell(' '), cell('x'), cell(' ')];
         let new: Vec<SnapCell> = vec![cell('$'), cell(' '), cell(' '), cell(' ')];
-        let er = find_erased(&old, &new);
+        let er = find_erased(&old, &new, false);
         assert_eq!(er.len(), 1);
         assert_eq!(er[0].0, 2);
         assert_eq!(er[0].1, 'x');
@@ -1889,7 +1899,20 @@ mod tests {
     fn overwrite_is_not_erase() {
         let old: Vec<SnapCell> = vec![cell('a'), cell(' ')];
         let new: Vec<SnapCell> = vec![cell('b'), cell(' ')];
-        assert!(find_erased(&old, &new).is_empty());
+        assert!(find_erased(&old, &new, false).is_empty());
+    }
+
+    #[test]
+    fn top_amount_shatters_replaced_text_too() {
+        // Two replaced cells out of ten stay below the 1/3 redraw gate.
+        let mut old = vec![cell(' '); 10];
+        old[0] = cell('a');
+        old[1] = cell('b');
+        let mut new = vec![cell(' '); 10];
+        new[0] = cell('c');
+        new[1] = cell('d');
+        assert!(find_erased(&old, &new, false).is_empty());
+        assert_eq!(find_erased(&old, &new, true).len(), 2);
     }
 
     #[test]
@@ -1897,14 +1920,14 @@ mod tests {
         // 2/4 cells changed incl. erases -> exceeds 1/3 threshold.
         let old: Vec<SnapCell> = vec![cell('a'), cell('b'), cell('c'), cell('d')];
         let new: Vec<SnapCell> = vec![cell(' '), cell('x'), cell(' '), cell('y')];
-        assert!(find_erased(&old, &new).is_empty());
+        assert!(find_erased(&old, &new, false).is_empty());
     }
 
     #[test]
     fn size_mismatch_ignored() {
         let old: Vec<SnapCell> = vec![cell('a')];
         let new: Vec<SnapCell> = vec![cell(' '), cell(' ')];
-        assert!(find_erased(&old, &new).is_empty());
+        assert!(find_erased(&old, &new, false).is_empty());
     }
 
     #[test]
@@ -1943,7 +1966,7 @@ mod tests {
         let mut old = vec![cell(' '); 1000];
         old[..100].fill(cell('x'));
         let new = vec![cell(' '); 1000];
-        let erased = find_erased(&old, &new);
+        let erased = find_erased(&old, &new, false);
         assert_eq!(erased.len(), 100);
         assert_eq!(
             sample_erases(erased, erase_budget(1.0)).len(),
