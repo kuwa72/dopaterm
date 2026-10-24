@@ -158,7 +158,7 @@ pub fn build(
     let row_h = ch * 1.8;
     let rows = match page {
         Page::General => 8.0,
-        Page::Effects => 12.0,
+        Page::Effects => 13.0,
     };
     let panel_w = (cw * PANEL_COLS).min(ww);
     let panel_h = rows * row_h + PADDING_Y * 2.0;
