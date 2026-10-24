@@ -16,11 +16,13 @@ foreground = "#c5c8c6"
 # sparks = 0.5        # keystroke sparks
 # shatter = 0.0       # erased-character shards off
 # cursor_trail = 1.0
+# scroll_trail = 1.0  # scrollback speed lines
 # fireworks = 1.0
 # wait_pulse = 1.0
 # confetti = 1.0
 # output_rain = 1.0
 # process_error = 1.0
 # bell_flash = 1.0
+# char_jump = 1.0     # occasional glyph hop
 
 # lua_dir = "/path/to/effects"     # default: <config dir>/effects/*.lua

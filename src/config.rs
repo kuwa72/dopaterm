@@ -43,6 +43,8 @@ pub struct EffectAmounts {
     pub wait_pulse: Option<f32>,
     pub confetti: Option<f32>,
     pub output_rain: Option<f32>,
+    /// Scrollback motion streaks.
+    pub scroll_trail: Option<f32>,
     pub process_error: Option<f32>,
     pub bell_flash: Option<f32>,
     /// Occasional character hop ("ぴょんぴょん").
@@ -50,10 +52,11 @@ pub struct EffectAmounts {
 }
 
 impl EffectAmounts {
-    pub const NAMES: [&'static str; 10] = [
+    pub const NAMES: [&'static str; 11] = [
         "sparks",
         "shatter",
         "cursor_trail",
+        "scroll_trail",
         "fireworks",
         "wait_pulse",
         "confetti",
@@ -68,6 +71,7 @@ impl EffectAmounts {
             "sparks" => self.sparks,
             "shatter" => self.shatter,
             "cursor_trail" => self.cursor_trail,
+            "scroll_trail" => self.scroll_trail,
             "fireworks" => self.fireworks,
             "wait_pulse" => self.wait_pulse,
             "confetti" => self.confetti,
@@ -84,6 +88,7 @@ impl EffectAmounts {
             "sparks" => self.sparks = value,
             "shatter" => self.shatter = value,
             "cursor_trail" => self.cursor_trail = value,
+            "scroll_trail" => self.scroll_trail = value,
             "fireworks" => self.fireworks = value,
             "wait_pulse" => self.wait_pulse = value,
             "confetti" => self.confetti = value,
@@ -101,6 +106,7 @@ impl EffectAmounts {
             sparks: value,
             shatter: value,
             cursor_trail: value,
+            scroll_trail: value,
             fireworks: value,
             wait_pulse: value,
             confetti: value,
