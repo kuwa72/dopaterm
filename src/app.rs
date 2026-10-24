@@ -50,6 +50,11 @@ pub struct App {
     sel_quads: Vec<Instance>,
     /// `bgs` + `sel_quads` merged for the draw call; reused every frame.
     draw_quads: Vec<Instance>,
+    /// Active character hop ("ぴょん") overlay state.
+    hop: Option<Hop>,
+    /// When the next hop is allowed to start.
+    next_hop: Instant,
+    hop_seed: u64,
     /// Consecutive render failures; a GPU adapter/surface change is
     /// unrecoverable for the old device, so a full rebuild is scheduled.
     render_failures: u32,
@@ -129,6 +134,9 @@ impl App {
             selection: None,
             sel_quads: Vec::new(),
             draw_quads: Vec::new(),
+            hop: None,
+            next_hop: Instant::now() + Duration::from_secs(2),
+            hop_seed: 0xC0FFEE_u64,
             render_failures: 0,
             gpu_resets: 0,
             skipped_frames: 0,
@@ -189,23 +197,28 @@ impl App {
     }
 
     fn build_overlay(&self) -> (Vec<Instance>, Vec<Line>, Vec<settings_ui::Hit>) {
-        if self.show_settings {
-            return self.build_settings_overlay();
-        }
-        let r = self.renderer.as_ref().unwrap();
-        let size = self.window.as_ref().unwrap().inner_size();
-        let anchor = (
-            self.last_cursor_px.0 - r.cell_w / 2.0,
-            self.last_cursor_px.1 - r.cell_h / 2.0,
-        );
-        let (quads, lines) = self.ime_preedit.overlay(
-            anchor,
-            (r.cell_w, r.cell_h),
-            (size.width as f32, size.height as f32),
-            parse_rgb(&self.cfg.foreground),
-            parse_rgb(&self.cfg.background),
-        );
-        (quads, lines, Vec::new())
+        let (mut quads, mut lines, hits) = if self.show_settings {
+            self.build_settings_overlay()
+        } else {
+            let r = self.renderer.as_ref().unwrap();
+            let size = self.window.as_ref().unwrap().inner_size();
+            let anchor = (
+                self.last_cursor_px.0 - r.cell_w / 2.0,
+                self.last_cursor_px.1 - r.cell_h / 2.0,
+            );
+            let (q, l) = self.ime_preedit.overlay(
+                anchor,
+                (r.cell_w, r.cell_h),
+                (size.width as f32, size.height as f32),
+                parse_rgb(&self.cfg.foreground),
+                parse_rgb(&self.cfg.background),
+            );
+            (q, l, Vec::new())
+        };
+        let (hq, hl) = self.hop_overlay();
+        quads.extend(hq);
+        lines.extend(hl);
+        (quads, lines, hits)
     }
 
     fn sync_ime(&mut self) {
@@ -1138,12 +1151,151 @@ impl App {
             self.fx.event(&FxEvent::Waiting { x, y });
             fired = true;
         }
+        // Occasional character hop ("ぴょん"). The amount gates the
+        // probability of a hop each scheduling window.
+        let jump_amt = self
+            .cfg
+            .effects
+            .amounts
+            .get("char_jump")
+            .unwrap_or(self.cfg.amount);
+        if self.hop.is_none() && Instant::now() >= self.next_hop && jump_amt > 0.0 {
+            self.next_hop =
+                Instant::now() + Duration::from_secs_f32(1.2 + frand(&mut self.hop_seed) * 2.5);
+            if frand(&mut self.hop_seed) < jump_amt && self.start_hop() {
+                fired = true;
+            }
+        }
         if fired {
             self.dirty = true;
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
         }
+    }
+
+    /// Pick a random visible printable cell and start a hop on it.
+    fn start_hop(&mut self) -> bool {
+        let rows = self.lines.len();
+        if rows == 0 || self.snapshot.is_empty() {
+            return false;
+        }
+        let cols = self.snapshot.len() / rows;
+        if cols == 0 {
+            return false;
+        }
+        let count = self
+            .snapshot
+            .iter()
+            .filter(|c| c.0 != ' ' && c.0 != '\0')
+            .count();
+        if count == 0 {
+            return false;
+        }
+        let pick = (frand(&mut self.hop_seed) * count as f32) as usize;
+        let idx = self
+            .snapshot
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.0 != ' ' && c.0 != '\0')
+            .nth(pick)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let (ch, fg, bg, bold, zero) = &self.snapshot[idx];
+        let mut text = String::from(*ch);
+        text.extend(zero.iter());
+        let wide = idx + 1 < self.snapshot.len() && self.snapshot[idx + 1].0 == '\0';
+        self.hop = Some(Hop {
+            idx,
+            text,
+            fg: *fg,
+            bg: *bg,
+            bold: *bold,
+            wide,
+            started: Instant::now(),
+            hops_left: if frand(&mut self.hop_seed) < 0.35 {
+                2
+            } else {
+                1
+            },
+        });
+        true
+    }
+
+    /// Advance/expire the hop; a second hop may chain while `hops_left` lasts.
+    fn update_hop(&mut self) {
+        let expired = self
+            .hop
+            .as_ref()
+            .map(|h| h.started.elapsed().as_secs_f32() >= HOP_DUR)
+            .unwrap_or(false);
+        if !expired {
+            return;
+        }
+        let h = self.hop.as_mut().unwrap();
+        if h.hops_left > 1 {
+            h.hops_left -= 1;
+            h.started = Instant::now();
+        } else {
+            self.hop = None;
+        }
+    }
+
+    /// Overlay quads + text for the active hop: a bg-colored cover over the
+    /// original cell, then the glyph drawn at its airborne offset.
+    fn hop_overlay(&self) -> (Vec<Instance>, Vec<Line>) {
+        let Some(h) = &self.hop else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(r) = self.renderer.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let rows = self.lines.len();
+        if rows == 0 || self.snapshot.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let cols = self.snapshot.len() / rows;
+        if cols == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let row = h.idx / cols;
+        let col = h.idx % cols;
+        // DOPA_HOP_DEMO freezes the arc at mid-air for screenshot verification.
+        let t = if std::env::var_os("DOPA_HOP_DEMO").is_some() {
+            0.5
+        } else {
+            (h.started.elapsed().as_secs_f32() / HOP_DUR).clamp(0.0, 1.0)
+        };
+        // Parabola up ~1 cell, with a decaying horizontal wobble.
+        let off_y = -r.cell_h * (std::f32::consts::PI * t).sin();
+        let off_x = 1.5 * (4.0 * std::f32::consts::PI * t).sin() * (1.0 - t);
+        let cover_w = r.cell_w * if h.wide { 2.0 } else { 1.0 };
+        let cover = Instance {
+            pos: [
+                col as f32 * r.cell_w + cover_w / 2.0,
+                row as f32 * r.cell_h + r.cell_h / 2.0,
+            ],
+            size: [cover_w, r.cell_h],
+            rot: 0.0,
+            kind: fx::SHAPE_RECT,
+            color: [
+                h.bg[0] as f32 / 255.0,
+                h.bg[1] as f32 / 255.0,
+                h.bg[2] as f32 / 255.0,
+                1.0,
+            ],
+        };
+        let line = Line {
+            top: row as f32 * r.cell_h + off_y,
+            left: col as f32 * r.cell_w + off_x,
+            spans: vec![Span {
+                text: h.text.clone(),
+                fg: h.fg,
+                bold: h.bold,
+            }],
+            family: None,
+        };
+        (vec![cover], vec![line])
     }
 
     /// Shatter the character that Backspace/Delete is about to remove, read
@@ -1222,6 +1374,32 @@ fn doomed_cell<E: alacritty_terminal::event::EventListener>(
 
 fn p_eq(p: Point, line: usize, col: usize) -> bool {
     p.line.0 == line as i32 && p.column.0 == col
+}
+
+/// Seconds per character hop ("ぴょん").
+const HOP_DUR: f32 = 0.42;
+
+/// One hopping character, captured from the cell snapshot when it starts.
+struct Hop {
+    /// Index into `snapshot` (row * cols + col).
+    idx: usize,
+    /// Glyph text incl. zero-width joiners.
+    text: String,
+    fg: [u8; 4],
+    bg: [u8; 4],
+    bold: bool,
+    /// Occupies two cells (wide char).
+    wide: bool,
+    started: Instant,
+    hops_left: u8,
+}
+
+/// xorshift64* — same shape as the one in fx::builtin, kept local.
+fn frand(seed: &mut u64) -> f32 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    (((*seed >> 8) as u32) & 0x00FF_FFFF) as f32 / ((1u32 << 24) as f32)
 }
 
 /// A mouse selection over the terminal grid. Lines are buffer coordinates:
@@ -2040,6 +2218,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.last_frame = now;
 
                 self.build_frame();
+                self.update_hop();
                 let animating = self.fx.tick(dt);
                 let fx_instances: Vec<Instance> = self.fx.instances().to_vec();
                 let clear = crate::colors::srgb_to_linear(crate::colors::to_f32_3(self.frame_bg));
@@ -2105,7 +2284,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if rendered {
                     self.dirty_lines.iter_mut().for_each(|d| *d = false);
                 }
-                if animating || self.dirty || self.shot_path.is_some() {
+                if animating || self.dirty || self.shot_path.is_some() || self.hop.is_some() {
                     self.window.as_ref().unwrap().request_redraw();
                     self.dirty = false;
                 }
@@ -2164,6 +2343,9 @@ impl ApplicationHandler<UserEvent> for App {
                             y: y + 340.0,
                         });
                         self.fx.event(&FxEvent::Waiting { x, y });
+                        if std::env::var_os("DOPA_HOP_DEMO").is_some() {
+                            self.start_hop();
+                        }
                         self.fx.event(&FxEvent::ChildError {
                             x: x + 220.0,
                             y: y + 180.0,

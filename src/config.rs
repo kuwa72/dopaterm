@@ -45,10 +45,12 @@ pub struct EffectAmounts {
     pub output_rain: Option<f32>,
     pub process_error: Option<f32>,
     pub bell_flash: Option<f32>,
+    /// Occasional character hop ("ぴょんぴょん").
+    pub char_jump: Option<f32>,
 }
 
 impl EffectAmounts {
-    pub const NAMES: [&'static str; 9] = [
+    pub const NAMES: [&'static str; 10] = [
         "sparks",
         "shatter",
         "cursor_trail",
@@ -58,6 +60,7 @@ impl EffectAmounts {
         "output_rain",
         "process_error",
         "bell_flash",
+        "char_jump",
     ];
 
     pub fn get(&self, name: &str) -> Option<f32> {
@@ -71,6 +74,7 @@ impl EffectAmounts {
             "output_rain" => self.output_rain,
             "process_error" => self.process_error,
             "bell_flash" => self.bell_flash,
+            "char_jump" => self.char_jump,
             _ => None,
         }
     }
@@ -86,6 +90,7 @@ impl EffectAmounts {
             "output_rain" => self.output_rain = value,
             "process_error" => self.process_error = value,
             "bell_flash" => self.bell_flash = value,
+            "char_jump" => self.char_jump = value,
             _ => {}
         }
     }
@@ -102,6 +107,7 @@ impl EffectAmounts {
             output_rain: value,
             process_error: value,
             bell_flash: value,
+            char_jump: value,
         }
     }
 }
