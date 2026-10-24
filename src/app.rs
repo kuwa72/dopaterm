@@ -605,6 +605,7 @@ impl App {
         match action {
             settings_ui::Action::Close => {
                 self.show_settings = false;
+                self.sync_ime();
             }
             settings_ui::Action::SetPage(p) => {
                 self.settings_page = *p;
@@ -1958,10 +1959,16 @@ impl ApplicationHandler<UserEvent> for App {
                     window.request_redraw();
                 }
             }
-            WindowEvent::Focused(false) => {
-                self.ime_preedit.clear();
-                self.ime_composing = false;
-                self.mods = ModifiersState::empty();
+            WindowEvent::Focused(focused) => {
+                if focused {
+                    // Re-assert ime_allowed: the IMM32 context can go stale
+                    // across focus loss and refuse to open the IME.
+                    self.sync_ime();
+                } else {
+                    self.ime_preedit.clear();
+                    self.ime_composing = false;
+                    self.mods = ModifiersState::empty();
+                }
                 self.dirty = true;
                 if let Some(window) = &self.window {
                     window.request_redraw();
