@@ -350,6 +350,8 @@ impl Effect for Sparks {
 pub struct Shatter {
     parts: Parts,
     rng: u64,
+    /// Impacts seen; every 4th gets a "nova" at stage 5.
+    hits: u32,
 }
 
 impl Shatter {
@@ -357,6 +359,7 @@ impl Shatter {
         Self {
             parts: Parts::default(),
             rng: 0x85ebca6b,
+            hits: 0,
         }
     }
 }
@@ -373,8 +376,10 @@ impl Effect for Shatter {
         else {
             return;
         };
+        self.hits = self.hits.wrapping_add(1);
         let n = (38.0 * density(scale)).round() as usize;
         let st = stage(scale);
+        let nova = st >= 5 && self.hits % 4 == 0;
         let c = brighten(*color, 1.5);
         let shapes = [
             SHAPE_RECT,
@@ -487,6 +492,42 @@ impl Effect for Shatter {
                     color: brighten(c, 1.2),
                     kind: SHAPE_STAR,
                     drag: 0.9,
+                    spin: true,
+                });
+            }
+        }
+        // Variable reward: every 4th impact at max is a nova, so the same
+        // update does not always pay out the same way (habituation).
+        if nova {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.5 * scale.max(0.5),
+                max_life: 0.5 * scale.max(0.5),
+                size: h.max(*w) * 3.6,
+                color: [1.0, 1.0, 1.0, 0.55],
+                kind: SHAPE_RING,
+                drag: 0.0,
+                spin: false,
+            });
+            for i in 0..10 {
+                let a = i as f32 * std::f32::consts::TAU / 10.0 + spread(&mut self.rng, 0.12);
+                let life = 0.45 + rand(&mut self.rng) * 0.2;
+                self.parts.spawn(Particle {
+                    x: *x,
+                    y: *y,
+                    vx: a.cos() * 260.0,
+                    vy: a.sin() * 260.0 - 80.0,
+                    ay: 420.0,
+                    life,
+                    max_life: life,
+                    size: 3.0 + rand(&mut self.rng) * 1.5,
+                    color: brighten(c, 1.35),
+                    kind: SHAPE_STAR,
+                    drag: 0.8,
                     spin: true,
                 });
             }
@@ -1364,6 +1405,10 @@ pub struct OutputRain {
     win_h: f32,
     /// Top-tier storm factor (0 below 0.8, 1.0 at max).
     boost: f32,
+    /// Sustained-output heat (0..1): rises with output, decays when quiet.
+    heat: f32,
+    /// Seconds until the next edge streak.
+    edge_timer: f32,
 }
 
 impl OutputRain {
@@ -1375,6 +1420,8 @@ impl OutputRain {
             win_w: 960.0,
             win_h: 600.0,
             boost: 0.0,
+            heat: 0.0,
+            edge_timer: 0.0,
         }
     }
 }
@@ -1385,12 +1432,18 @@ const RAIN_MAX_PARTS: usize = 220;
 /// Stars spawned per frame; a burst must not become a wall of streaks.
 const RAIN_MAX_SPAWNS: usize = 2;
 
-fn rain_cap(boost: f32) -> usize {
-    RAIN_MAX_PARTS + (RAIN_MAX_PARTS as f32 * 0.5 * boost) as usize
+/// Storm strength blends the top-tier factor with sustained-output heat, so
+/// heavy output ramps up and then settles instead of staying flat.
+fn storm(boost: f32, heat: f32) -> f32 {
+    boost * (0.4 + 0.6 * heat)
 }
 
-fn rain_spawns(boost: f32) -> usize {
-    RAIN_MAX_SPAWNS + (2.0 * boost) as usize
+fn rain_cap(boost: f32, heat: f32) -> usize {
+    RAIN_MAX_PARTS + (RAIN_MAX_PARTS as f32 * 0.9 * storm(boost, heat)) as usize
+}
+
+fn rain_spawns(boost: f32, heat: f32) -> usize {
+    RAIN_MAX_SPAWNS + (3.0 * storm(boost, heat)) as usize
 }
 
 impl Effect for OutputRain {
@@ -1401,6 +1454,8 @@ impl Effect for OutputRain {
     fn on_event(&mut self, ev: &FxEvent, scale: f32) {
         if let FxEvent::PtyOutput { n, w, h } = ev {
             self.boost = overdrive(scale);
+            // Sustained output builds heat; short bursts barely move it.
+            self.heat = (self.heat + (*n as f32).sqrt() * 0.004 * density(scale)).min(1.0);
             // Wakeups are coalesced per frame, but their count still grows
             // with throughput; sqrt keeps a big burst from multiplying.
             self.budget = (self.budget + (*n as f32).sqrt() * 0.10 * density(scale))
@@ -1411,11 +1466,13 @@ impl Effect for OutputRain {
     }
 
     fn update(&mut self, dt: f32) {
+        self.heat = (self.heat - dt * 0.8).max(0.0);
+        self.edge_timer = (self.edge_timer - dt).max(0.0);
         self.parts.step(dt);
-        let cap = if self.parts.0.len() >= rain_cap(self.boost) {
+        let cap = if self.parts.0.len() >= rain_cap(self.boost, self.heat) {
             0
         } else {
-            (self.budget as usize).min(rain_spawns(self.boost))
+            (self.budget as usize).min(rain_spawns(self.boost, self.heat))
         };
         for _ in 0..cap {
             self.budget -= 1.0;
@@ -1449,13 +1506,35 @@ impl Effect for OutputRain {
                 tail,
             );
         }
+        // A hot storm at max also lights the top and bottom edges. Thin,
+        // short-lived, and rate-limited: no full-screen flash.
+        if self.boost > 0.5 && self.heat > 0.6 && self.edge_timer <= 0.0 {
+            self.edge_timer = 0.22;
+            let color = hsv(&mut self.rng, 0.55, 1.0);
+            for y in [6.0, self.win_h - 6.0] {
+                self.parts.spawn(Particle {
+                    x: self.win_w * 0.5,
+                    y,
+                    vx: 0.0,
+                    vy: 1.0,
+                    ay: 0.0,
+                    life: 0.18,
+                    max_life: 0.18,
+                    size: self.win_w * 1.1,
+                    color: [color[0], color[1], color[2], 0.28],
+                    kind: SHAPE_BEAM,
+                    drag: 0.0,
+                    spin: true,
+                });
+            }
+        }
     }
 
     fn collect(&self, out: &mut Vec<Instance>) {
         self.parts.collect(out);
     }
     fn active(&self) -> bool {
-        self.parts.alive() || self.budget >= 1.0
+        self.parts.alive() || self.budget >= 1.0 || self.heat > 0.0
     }
 }
 
@@ -1616,7 +1695,7 @@ mod tests {
         rain.on_event(&output_event(10_000), 1.0);
         let peak = rain_peak(&mut rain, 180);
         assert!(
-            peak <= rain_cap(1.0),
+            peak <= rain_cap(1.0, 1.0),
             "max storm peaked at {peak} particles"
         );
     }
@@ -1628,7 +1707,35 @@ mod tests {
         rain.update(1.0 / 60.0);
         // Each star is the head plus its boosted comet tail.
         let per_star = 1 + 6 + 2;
-        assert!(rain.parts.0.len() <= rain_spawns(1.0) * per_star);
+        assert!(rain.parts.0.len() <= rain_spawns(1.0, 1.0) * per_star);
+    }
+
+    #[test]
+    fn output_rain_heats_up_and_settles() {
+        let mut rain = OutputRain::new();
+        rain.on_event(&output_event(10_000), 1.0);
+        assert!(rain.heat > 0.4, "a big burst should build heat");
+        for _ in 0..180 {
+            rain.update(1.0 / 60.0);
+        }
+        assert_eq!(rain.heat, 0.0);
+        assert!(!rain.active());
+    }
+
+    #[test]
+    fn edge_streaks_only_appear_in_a_hot_max_storm() {
+        let mut hot = OutputRain::new();
+        hot.boost = 1.0;
+        hot.heat = 1.0;
+        hot.update(1.0 / 60.0);
+        assert_eq!(
+            hot.parts.0.iter().filter(|p| p.kind == SHAPE_BEAM).count(),
+            2
+        );
+        let mut calm = OutputRain::new();
+        calm.heat = 1.0;
+        calm.update(1.0 / 60.0);
+        assert!(!calm.parts.0.iter().any(|p| p.kind == SHAPE_BEAM));
     }
 
     #[test]
@@ -1787,6 +1894,46 @@ mod tests {
 
     fn command_done_event() -> FxEvent {
         FxEvent::CommandDone { x: 200.0, y: 200.0 }
+    }
+
+    fn erased_event() -> FxEvent {
+        FxEvent::Erased {
+            ch: 'x',
+            x: 100.0,
+            y: 100.0,
+            w: 8.0,
+            h: 18.0,
+            color: [1.0, 0.5, 0.3, 1.0],
+        }
+    }
+
+    #[test]
+    fn every_fourth_impact_is_a_nova_at_max() {
+        let mut normal = Shatter::new();
+        normal.on_event(&erased_event(), 1.0);
+        let base = normal.parts.0.len();
+
+        let mut nova = Shatter::new();
+        for _ in 0..3 {
+            nova.on_event(&erased_event(), 1.0);
+        }
+        nova.parts.0.clear();
+        nova.on_event(&erased_event(), 1.0);
+        assert!(
+            nova.parts.0.len() > base,
+            "the 4th impact should pay out more"
+        );
+
+        // Below stage 5 the cadence stays flat.
+        let mut calm_first = Shatter::new();
+        calm_first.on_event(&erased_event(), 0.5);
+        let mut calm = Shatter::new();
+        for _ in 0..3 {
+            calm.on_event(&erased_event(), 0.5);
+        }
+        calm.parts.0.clear();
+        calm.on_event(&erased_event(), 0.5);
+        assert_eq!(calm.parts.0.len(), calm_first.parts.0.len());
     }
 
     #[test]
