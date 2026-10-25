@@ -160,7 +160,8 @@ pub struct Parts(pub Vec<Particle>);
 
 /// Hard cap on live particles per effect. Normal bursts fit comfortably;
 /// mass updates that would otherwise pile up thousands of quads are dropped.
-pub const MAX_LIVE_PARTS: usize = 900;
+/// The theme-park tier (0.8+) needs headroom for shatter trails and jackpots.
+pub const MAX_LIVE_PARTS: usize = 1400;
 
 impl Parts {
     pub fn spawn(&mut self, p: Particle) {

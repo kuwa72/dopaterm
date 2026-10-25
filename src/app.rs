@@ -2601,6 +2601,19 @@ impl ApplicationHandler<UserEvent> for App {
                             h: ch,
                             color: [1.0, 0.5, 0.3, 1.0],
                         });
+                        if std::env::var_os("DOPA_ERASE_DEMO").is_some() {
+                            // Four impacts total: the 4th is a nova at max.
+                            for i in 1..=3 {
+                                self.fx.event(&FxEvent::Erased {
+                                    ch: 'x',
+                                    x: x + cw * 3.0 + cw * 9.0 * i as f32,
+                                    y: y + ch * 3.0 * i as f32,
+                                    w: cw,
+                                    h: ch,
+                                    color: [1.0, 0.5 + 0.1 * i as f32, 0.3, 1.0],
+                                });
+                            }
+                        }
                         self.fx.event(&FxEvent::CursorMoved {
                             x,
                             y,
@@ -2679,10 +2692,10 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         // Scroll streaks are short-lived, so fire them after
                         // the settle ticks; the still must catch them alive.
-                        if std::env::var_os("DOPA_SCROLL_DEMO").is_some() {
+                        if let Ok(v) = std::env::var("DOPA_SCROLL_DEMO") {
                             let ws = self.window.as_ref().unwrap().inner_size();
                             self.fx.event(&FxEvent::Scrolled {
-                                lines: 6,
+                                lines: v.parse().unwrap_or(6),
                                 w: ws.width as f32,
                                 h: ws.height as f32,
                             });
