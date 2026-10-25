@@ -955,18 +955,48 @@ impl App {
         // Pass 1: snapshot cells, detect erase events.
         let snap = snapshot_grid(&guard, default_fg, default_bg);
         let scrolled = offset != self.prev_offset;
+        // Pagers and TUIs (less, vim) scroll by repainting rows instead of
+        // moving the scrollback, so display_offset never changes. Detect a
+        // row shift and drive ScrollTrail from it too. In the alt screen even
+        // a one-line wheel step counts; on the primary screen one-line shifts
+        // are ordinary output and stay with OutputRain.
+        let alt_screen = guard.mode().contains(TermMode::ALT_SCREEN);
+        let internal_scroll = if scrolled {
+            None
+        } else {
+            let min_shift = if alt_screen { 1 } else { 2 };
+            detect_scroll_shift(&self.snapshot, &snap, cols, rows, min_shift)
+        };
+        if let Some(lines) = internal_scroll {
+            let (ww, wh) = self.window_px();
+            self.fx.event(&FxEvent::Scrolled {
+                lines,
+                w: ww,
+                h: wh,
+            });
+        }
+        let view_scrolled = scrolled || internal_scroll.is_some();
 
         if std::env::var_os("DOPA_DEBUG").is_some() {
             let nonspace = snap.iter().filter(|c| !matches!(c.0, ' ' | '\0')).count();
             eprintln!(
-                "dopaterm: nonspace={} scrolled={} rows={}",
-                nonspace, scrolled, rows
+                "dopaterm: nonspace={} scrolled={} internal={:?} rows={}",
+                nonspace, scrolled, internal_scroll, rows
             );
         }
 
         // Mass changes = scroll/redraw; suppress shatter storms.
-        if !scrolled {
-            let erased = find_erased(&self.snapshot, &snap);
+        if !view_scrolled {
+            // The bound follows the 10-step effect amount (and any shatter
+            // override). At stage 5 the diff also includes in-place text
+            // replacements, so every screen update gets debris.
+            let shatter = self
+                .cfg
+                .effects
+                .amounts
+                .get("shatter")
+                .unwrap_or(self.cfg.amount);
+            let erased = find_erased(&self.snapshot, &snap, shatter >= 0.9);
             if std::env::var_os("DOPA_DEBUG").is_some() && !erased.is_empty() {
                 eprintln!(
                     "dopaterm: erased {:?}",
@@ -976,14 +1006,7 @@ impl App {
             self.predicted_erase
                 .retain(|(_, at)| at.elapsed() < Duration::from_secs(1));
             // A burst of erases is a redraw, not per-character editing: keep
-            // the count bounded instead of shattering every cell. The bound
-            // follows the 10-step effect amount (and any shatter override).
-            let shatter = self
-                .cfg
-                .effects
-                .amounts
-                .get("shatter")
-                .unwrap_or(self.cfg.amount);
+            // the count bounded instead of shattering every cell.
             for (i, ch_, fg_) in sample_erases(erased, erase_budget(shatter)) {
                 // Skip cells already shattered by key-press prediction.
                 if self
@@ -1023,8 +1046,8 @@ impl App {
         }
         // Big repaints (output bursts, clear, alt-screen apps) should not
         // spray cursor-trail comets across the screen.
-        let heavy_update = is_heavy_update(scrolled, changed_cells, snap.len());
-        if scrolled {
+        let heavy_update = is_heavy_update(view_scrolled, changed_cells, snap.len());
+        if view_scrolled {
             self.dirty_lines.iter_mut().for_each(|d| *d = true);
         }
         if self.prev_cursor != Some(cursor_point) {
@@ -1622,10 +1645,72 @@ fn is_heavy_update(scrolled: bool, changed_cells: usize, cells: usize) -> bool {
     scrolled || changed_cells * 8 >= cells
 }
 
-/// Cells that went non-space -> space between snapshots (candidate erases).
-/// Returns (cell_index, erased_char, old_fg). Suppressed when more than a
-/// third of the grid changed (scroll/redraw storms aren't deletions).
-fn find_erased(old: &[SnapCell], new: &[SnapCell]) -> Vec<(usize, char, [u8; 4])> {
+fn row_has_content(row: &[SnapCell]) -> bool {
+    row.iter().any(|c| !matches!(c.0, ' ' | '\0'))
+}
+
+/// Detect an internal scroll in the visible grid: pagers and TUIs (less, vim)
+/// move content by repainting rows, so `display_offset` never changes. Returns
+/// the shift with `Scrolled` sign (positive = text moved down). `min_shift`
+/// lets the alt screen accept one-line wheel steps while the primary screen
+/// leaves one-line output scrolling to `OutputRain`.
+fn detect_scroll_shift(
+    old: &[SnapCell],
+    new: &[SnapCell],
+    cols: usize,
+    rows: usize,
+    min_shift: usize,
+) -> Option<i32> {
+    if cols == 0 || rows < 4 || old.len() != cols * rows || new.len() != cols * rows || old == new {
+        return None;
+    }
+    let old_rows: Vec<&[SnapCell]> = old.chunks_exact(cols).collect();
+    let new_rows: Vec<&[SnapCell]> = new.chunks_exact(cols).collect();
+    let mut best: Option<(usize, i32)> = None;
+    for k in min_shift.max(1)..=rows / 2 {
+        let span = rows - k;
+        if span < 3 {
+            break;
+        }
+        let mut up = 0usize;
+        let mut up_content = 0usize;
+        let mut down = 0usize;
+        let mut down_content = 0usize;
+        for i in 0..span {
+            if new_rows[i] == old_rows[i + k] {
+                up += 1;
+                if row_has_content(new_rows[i]) {
+                    up_content += 1;
+                }
+            }
+            if new_rows[i + k] == old_rows[i] {
+                down += 1;
+                if row_has_content(new_rows[i + k]) {
+                    down_content += 1;
+                }
+            }
+        }
+        let enough = span * 8;
+        if up * 10 >= enough && up_content >= 2 && best.is_none_or(|(s, _)| up > s) {
+            best = Some((up, -(k as i32)));
+        }
+        if down * 10 >= enough && down_content >= 2 && best.is_none_or(|(s, _)| down > s) {
+            best = Some((down, k as i32));
+        }
+    }
+    best.map(|(_, lines)| lines)
+}
+
+/// Cells that disappeared or changed between snapshots (candidate impacts).
+/// `include_overwrites` also returns in-place character replacements, which
+/// only unlocks at the top of the dial so ordinary updates get debris too.
+/// Returns (cell_index, old_char, old_fg). Suppressed when more than a third
+/// of the grid changed (scroll/redraw storms aren't deletions).
+fn find_erased(
+    old: &[SnapCell],
+    new: &[SnapCell],
+    include_overwrites: bool,
+) -> Vec<(usize, char, [u8; 4])> {
     if old.len() != new.len() || new.is_empty() {
         return Vec::new();
     }
@@ -1634,7 +1719,9 @@ fn find_erased(old: &[SnapCell], new: &[SnapCell]) -> Vec<(usize, char, [u8; 4])
     for (i, (o, n)) in old.iter().zip(new.iter()).enumerate() {
         if o != n {
             changed += 1;
-            if !matches!(o.0, ' ' | '\0') && matches!(n.0, ' ' | '\0') {
+            let gone = !matches!(o.0, ' ' | '\0') && matches!(n.0, ' ' | '\0');
+            let replaced = include_overwrites && !matches!(o.0, ' ' | '\0') && o.0 != n.0;
+            if gone || replaced {
                 out.push((i, o.0, o.1));
             }
         }
@@ -1850,7 +1937,7 @@ mod tests {
     fn spacer_removal_does_not_spawn_a_glyph_particle() {
         let mut old = vec![cell(' '); 12];
         old[2] = cell('\0');
-        assert!(find_erased(&old, &vec![cell(' '); 12]).is_empty());
+        assert!(find_erased(&old, &vec![cell(' '); 12], false).is_empty());
     }
 
     #[test]
@@ -1879,7 +1966,7 @@ mod tests {
         // "$ x" then x erased -> single erase at index 2.
         let old: Vec<SnapCell> = vec![cell('$'), cell(' '), cell('x'), cell(' ')];
         let new: Vec<SnapCell> = vec![cell('$'), cell(' '), cell(' '), cell(' ')];
-        let er = find_erased(&old, &new);
+        let er = find_erased(&old, &new, false);
         assert_eq!(er.len(), 1);
         assert_eq!(er[0].0, 2);
         assert_eq!(er[0].1, 'x');
@@ -1889,7 +1976,68 @@ mod tests {
     fn overwrite_is_not_erase() {
         let old: Vec<SnapCell> = vec![cell('a'), cell(' ')];
         let new: Vec<SnapCell> = vec![cell('b'), cell(' ')];
-        assert!(find_erased(&old, &new).is_empty());
+        assert!(find_erased(&old, &new, false).is_empty());
+    }
+
+    #[test]
+    fn top_amount_shatters_replaced_text_too() {
+        // Two replaced cells out of ten stay below the 1/3 redraw gate.
+        let mut old = vec![cell(' '); 10];
+        old[0] = cell('a');
+        old[1] = cell('b');
+        let mut new = vec![cell(' '); 10];
+        new[0] = cell('c');
+        new[1] = cell('d');
+        assert!(find_erased(&old, &new, false).is_empty());
+        assert_eq!(find_erased(&old, &new, true).len(), 2);
+    }
+
+    #[test]
+    fn internal_scrolls_are_detected() {
+        let cols = 4;
+        let rows = 8;
+        let make = |chars: [char; 8]| -> Vec<SnapCell> {
+            chars
+                .iter()
+                .flat_map(|&c| (0..cols).map(move |_| cell(c)))
+                .collect()
+        };
+        let old = make(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']);
+        assert_eq!(
+            detect_scroll_shift(
+                &old,
+                &make(['C', 'D', 'E', 'F', 'G', 'H', 'X', 'Y']),
+                cols,
+                rows,
+                1
+            ),
+            Some(-2)
+        );
+        assert_eq!(
+            detect_scroll_shift(
+                &old,
+                &make(['X', 'Y', 'A', 'B', 'C', 'D', 'E', 'F']),
+                cols,
+                rows,
+                1
+            ),
+            Some(2)
+        );
+        // One-line wheel steps count in the alt screen...
+        let one = make(['B', 'C', 'D', 'E', 'F', 'G', 'H', 'X']);
+        assert_eq!(detect_scroll_shift(&old, &one, cols, rows, 1), Some(-1));
+        // ...but not on the primary screen (OutputRain covers that).
+        assert_eq!(detect_scroll_shift(&old, &one, cols, rows, 2), None);
+        assert_eq!(
+            detect_scroll_shift(
+                &old,
+                &make(['1', '2', '3', '4', '5', '6', '7', '8']),
+                cols,
+                rows,
+                1
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1897,14 +2045,14 @@ mod tests {
         // 2/4 cells changed incl. erases -> exceeds 1/3 threshold.
         let old: Vec<SnapCell> = vec![cell('a'), cell('b'), cell('c'), cell('d')];
         let new: Vec<SnapCell> = vec![cell(' '), cell('x'), cell(' '), cell('y')];
-        assert!(find_erased(&old, &new).is_empty());
+        assert!(find_erased(&old, &new, false).is_empty());
     }
 
     #[test]
     fn size_mismatch_ignored() {
         let old: Vec<SnapCell> = vec![cell('a')];
         let new: Vec<SnapCell> = vec![cell(' '), cell(' ')];
-        assert!(find_erased(&old, &new).is_empty());
+        assert!(find_erased(&old, &new, false).is_empty());
     }
 
     #[test]
@@ -1943,7 +2091,7 @@ mod tests {
         let mut old = vec![cell(' '); 1000];
         old[..100].fill(cell('x'));
         let new = vec![cell(' '); 1000];
-        let erased = find_erased(&old, &new);
+        let erased = find_erased(&old, &new, false);
         assert_eq!(erased.len(), 100);
         assert_eq!(
             sample_erases(erased, erase_budget(1.0)).len(),
@@ -2453,6 +2601,19 @@ impl ApplicationHandler<UserEvent> for App {
                             h: ch,
                             color: [1.0, 0.5, 0.3, 1.0],
                         });
+                        if std::env::var_os("DOPA_ERASE_DEMO").is_some() {
+                            // Four impacts total: the 4th is a nova at max.
+                            for i in 1..=3 {
+                                self.fx.event(&FxEvent::Erased {
+                                    ch: 'x',
+                                    x: x + cw * 3.0 + cw * 9.0 * i as f32,
+                                    y: y + ch * 3.0 * i as f32,
+                                    w: cw,
+                                    h: ch,
+                                    color: [1.0, 0.5 + 0.1 * i as f32, 0.3, 1.0],
+                                });
+                            }
+                        }
                         self.fx.event(&FxEvent::CursorMoved {
                             x,
                             y,
@@ -2531,10 +2692,10 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         // Scroll streaks are short-lived, so fire them after
                         // the settle ticks; the still must catch them alive.
-                        if std::env::var_os("DOPA_SCROLL_DEMO").is_some() {
+                        if let Ok(v) = std::env::var("DOPA_SCROLL_DEMO") {
                             let ws = self.window.as_ref().unwrap().inner_size();
                             self.fx.event(&FxEvent::Scrolled {
-                                lines: 6,
+                                lines: v.parse().unwrap_or(6),
                                 w: ws.width as f32,
                                 h: ws.height as f32,
                             });

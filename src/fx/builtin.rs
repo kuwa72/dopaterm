@@ -24,7 +24,10 @@ fn rand_vec(seed: &mut u64, mag: f32) -> (f32, f32) {
 }
 
 fn hsv(seed: &mut u64, s: f32, v: f32) -> [f32; 4] {
-    let h = rand(seed);
+    hsv_at(rand(seed), s, v)
+}
+
+fn hsv_at(h: f32, s: f32, v: f32) -> [f32; 4] {
     let i = (h * 6.0).floor();
     let f = h * 6.0 - i;
     let p = v * (1.0 - s);
@@ -54,6 +57,35 @@ fn brighten(c: [f32; 4], k: f32) -> [f32; 4] {
 /// white-hot impact in the value hierarchy.
 fn with_alpha(c: [f32; 4], a: f32) -> [f32; 4] {
     [c[0], c[1], c[2], c[3] * a]
+}
+
+/// Theme-park tier: a hard step at 0.8 (0.5) ramping to 1.0 at max. Below 0.8
+/// the dial stays in everyday range; 0.8+ deliberately goes over the top.
+fn overdrive(scale: f32) -> f32 {
+    if scale < 0.8 {
+        return 0.0;
+    }
+    0.5 + 0.5 * ((scale - 0.8) / 0.2).clamp(0.0, 1.0)
+}
+
+/// Visible intensity stage for the 10-step dial (0 = off). Every 0.2 unlocks
+/// one more layer, so 0.1..0.9 is not just "fewer of the same particles".
+fn stage(scale: f32) -> u8 {
+    match scale {
+        s if s <= 0.0 => 0,
+        s if s < 0.3 => 1,
+        s if s < 0.5 => 2,
+        s if s < 0.7 => 3,
+        s if s < 0.9 => 4,
+        _ => 5,
+    }
+}
+
+/// Particle density curve. It spreads the ten steps apart and ramps harder at
+/// the top, so each 0.1 is visible instead of a linear "slightly more".
+fn density(scale: f32) -> f32 {
+    let s = scale.clamp(0.0, 1.0);
+    s * (0.75 + 0.65 * s)
 }
 
 fn key_color(ch: Option<char>) -> [f32; 4] {
@@ -172,10 +204,59 @@ fn spawn_burst(
     }
 }
 
+/// Keystrokes closer together than this keep the combo alive.
+const COMBO_WINDOW: f32 = 0.35;
+/// Quiet time after which the combo resets.
+const COMBO_RESET: f32 = 0.6;
+
+/// Milestone reward for sustained typing: a white ring plus a star spray.
+/// The color shifts with each milestone so the reward never looks identical.
+fn spawn_combo_burst(parts: &mut Parts, rng: &mut u64, x: f32, y: f32, combo: u32, scale: f32) {
+    let color = hsv(rng, 0.65, 1.0);
+    parts.spawn(Particle {
+        x,
+        y,
+        vx: 0.0,
+        vy: 0.0,
+        ay: 0.0,
+        life: 0.34 * scale.max(0.4),
+        max_life: 0.34 * scale.max(0.4),
+        size: 14.0 + (combo as f32).sqrt() * 2.0,
+        color: [1.0, 1.0, 1.0, 0.9],
+        kind: SHAPE_RING,
+        drag: 0.0,
+        spin: false,
+    });
+    let n = (7.0 * density(scale)).round().max(2.0) as usize;
+    for i in 0..n {
+        let a = i as f32 * std::f32::consts::TAU / n as f32 + spread(rng, 0.2);
+        let v = 130.0 + rand(rng) * 60.0;
+        let life = 0.3 + rand(rng) * 0.15;
+        parts.spawn(Particle {
+            x,
+            y,
+            vx: a.cos() * v,
+            vy: a.sin() * v - 40.0,
+            ay: 220.0,
+            life,
+            max_life: life,
+            size: 2.5 + rand(rng) * 2.0,
+            color,
+            kind: SHAPE_STAR,
+            drag: 1.0,
+            spin: true,
+        });
+    }
+}
+
 /// Keystroke: colored sparks plus an expanding ring keyed by the typed character.
 pub struct Sparks {
     parts: Parts,
     rng: u64,
+    /// Consecutive keystrokes; resets after a quiet beat.
+    combo: u32,
+    /// Seconds since the last keystroke.
+    idle: f32,
 }
 
 impl Sparks {
@@ -183,6 +264,8 @@ impl Sparks {
         Self {
             parts: Parts::default(),
             rng: 0x9e3779b97f4a7c15,
+            combo: 0,
+            idle: COMBO_RESET,
         }
     }
 }
@@ -196,14 +279,27 @@ impl Effect for Sparks {
         let FxEvent::Key { kind, ch, x, y } = ev else {
             return;
         };
-        let color = match kind {
-            KeyKind::Char => key_color(*ch),
-            KeyKind::Backspace => [1.0, 0.35, 0.45, 1.0],
-            KeyKind::Enter => [1.0, 0.85, 0.25, 1.0],
-            KeyKind::Arrow => [0.55, 0.75, 1.0, 1.0],
-            KeyKind::Other => [0.75, 0.75, 0.85, 1.0],
+        self.combo = if self.idle <= COMBO_WINDOW {
+            self.combo + 1
+        } else {
+            1
         };
-        let n = (18.0 * scale).round() as usize;
+        self.idle = 0.0;
+        let od = overdrive(scale);
+        let st = stage(scale);
+        // Theme-park tier: keystrokes turn into rainbow sparks.
+        let color = if od > 0.5 {
+            hsv(&mut self.rng, 0.7, 1.0)
+        } else {
+            match kind {
+                KeyKind::Char => key_color(*ch),
+                KeyKind::Backspace => [1.0, 0.35, 0.45, 1.0],
+                KeyKind::Enter => [1.0, 0.85, 0.25, 1.0],
+                KeyKind::Arrow => [0.55, 0.75, 1.0, 1.0],
+                KeyKind::Other => [0.75, 0.75, 0.85, 1.0],
+            }
+        };
+        let n = ((18.0 + 8.0 * od) * density(scale)).round() as usize;
         for _ in 0..n {
             let life = 0.18 + rand(&mut self.rng) * 0.28;
             spawn_spark(
@@ -226,16 +322,31 @@ impl Effect for Sparks {
             ay: 0.0,
             life: 0.28 * scale.max(0.4),
             max_life: 0.28 * scale.max(0.4),
-            size: 8.0 + scale * 6.0,
+            size: 8.0 + density(scale) * 6.0 + od * 4.0,
             color: [color[0], color[1], color[2], 0.9],
             kind: SHAPE_RING,
             drag: 0.0,
             spin: false,
         });
+        // Milestones get closer as the dial rises: 50, then 25, then 10.
+        let step = match st {
+            5 => 10,
+            3 | 4 => 25,
+            _ => 50,
+        };
+        if self.combo % step == 0 {
+            spawn_combo_burst(&mut self.parts, &mut self.rng, *x, *y, self.combo, scale);
+        }
     }
 
     fn update(&mut self, dt: f32) {
         self.parts.step(dt);
+        if self.idle < COMBO_RESET {
+            self.idle += dt;
+        }
+        if self.idle >= COMBO_RESET {
+            self.combo = 0;
+        }
     }
     fn collect(&self, out: &mut Vec<Instance>) {
         self.parts.collect(out);
@@ -249,6 +360,8 @@ impl Effect for Sparks {
 pub struct Shatter {
     parts: Parts,
     rng: u64,
+    /// Impacts seen; every 4th gets a "nova" at stage 5.
+    hits: u32,
 }
 
 impl Shatter {
@@ -256,6 +369,7 @@ impl Shatter {
         Self {
             parts: Parts::default(),
             rng: 0x85ebca6b,
+            hits: 0,
         }
     }
 }
@@ -272,68 +386,240 @@ impl Effect for Shatter {
         else {
             return;
         };
-        let n = (38.0 * scale).round() as usize;
+        self.hits = self.hits.wrapping_add(1);
+        let n = (38.0 * density(scale)).round() as usize;
+        let st = stage(scale);
+        let od = overdrive(scale);
+        let nova = st >= 5 && self.hits % 4 == 0;
         let c = brighten(*color, 1.5);
+        // Glass-like shards, not cardboard rectangles: half the burst is
+        // evenly spaced so it reads as a designed shatter, half is chaotic.
         let shapes = [
-            SHAPE_RECT,
-            SHAPE_RECT,
+            SHAPE_DIAMOND,
             SHAPE_DIAMOND,
             SHAPE_STAR,
             SHAPE_BOLT,
+            SHAPE_RECT,
         ];
-        for _ in 0..n {
+        for i in 0..n {
             let life = 0.45 + rand(&mut self.rng) * 0.55;
             let size = if rand(&mut self.rng) < 0.25 {
-                (*h / 2.2) + rand(&mut self.rng) * (*h / 1.8)
+                11.0 + rand(&mut self.rng) * (*h / 1.6).max(10.0)
             } else {
-                3.0 + rand(&mut self.rng) * (*h / 2.8).max(4.0)
+                4.0 + rand(&mut self.rng) * (*h / 2.0).max(6.0)
             };
-            let kind = shapes[(rand(&mut self.rng) * shapes.len() as f32) as usize % shapes.len()];
-            let (vx, vy) = rand_vec(&mut self.rng, 420.0);
+            let structured = i % 2 == 0;
+            let angle = if structured {
+                i as f32 * std::f32::consts::TAU / n as f32 + spread(&mut self.rng, 0.16)
+            } else {
+                rand(&mut self.rng) * std::f32::consts::TAU
+            };
+            let speed = if structured {
+                260.0 + rand(&mut self.rng) * 140.0
+            } else {
+                120.0 + rand(&mut self.rng) * 420.0
+            };
+            let kind = if structured {
+                [SHAPE_DIAMOND, SHAPE_STAR, SHAPE_BOLT][i % 3]
+            } else {
+                shapes[(rand(&mut self.rng) * shapes.len() as f32) as usize % shapes.len()]
+            };
+            // At 0.8+ a quarter of the shards turn rainbow.
+            let sc = if st >= 4 && rand(&mut self.rng) < 0.25 {
+                hsv(&mut self.rng, 0.75, 1.0)
+            } else {
+                c
+            };
+            let vx = angle.cos() * speed;
+            let vy = angle.sin() * speed - 70.0;
+            let px = x + spread(&mut self.rng, w / 2.0);
+            let py = y + spread(&mut self.rng, h / 2.0);
             self.parts.spawn(Particle {
-                x: x + spread(&mut self.rng, w / 2.0),
-                y: y + spread(&mut self.rng, h / 2.0),
+                x: px,
+                y: py,
                 vx,
-                vy: vy - 80.0 - rand(&mut self.rng) * 200.0,
+                vy,
                 ay: 1000.0,
                 life,
                 max_life: life,
                 size,
-                color: c,
+                color: sc,
                 kind,
                 drag: 0.5 + rand(&mut self.rng) * 0.6,
                 spin: true,
             });
+            // A short comet tail on some shards makes the motion readable.
+            if i % 8 == 0 {
+                for j in 1..=3 {
+                    let t = j as f32;
+                    self.parts.spawn(Particle {
+                        x: px - vx * 0.018 * t,
+                        y: py - vy * 0.018 * t,
+                        vx: vx * 0.15,
+                        vy: vy * 0.15,
+                        ay: 0.0,
+                        life: 0.16,
+                        max_life: 0.16,
+                        size: 2.4,
+                        color: [sc[0], sc[1], sc[2], 0.6],
+                        kind: SHAPE_GLOW,
+                        drag: 2.0,
+                        spin: false,
+                    });
+                }
+            }
         }
-        // Shockwave ring.
-        self.parts.spawn(Particle {
-            x: *x,
-            y: *y,
-            vx: 0.0,
-            vy: 0.0,
-            ay: 0.0,
-            life: 0.35 * scale.max(0.5),
-            max_life: 0.35 * scale.max(0.5),
-            size: h.max(*w) * 1.2,
-            color: [c[0], c[1], c[2], 0.75],
-            kind: SHAPE_RING,
-            drag: 0.0,
-            spin: false,
-        });
-        // Hot sparks.
-        for _ in 0..(8.0 * scale).round() as usize {
-            let g = 0.5 + rand(&mut self.rng) * 0.4;
-            let life = 0.25 + rand(&mut self.rng) * 0.2;
-            spawn_spark(
-                &mut self.parts,
-                &mut self.rng,
-                *x,
-                *y,
-                [1.0, g, 0.2, 1.0],
-                220.0,
-                life,
-                SHAPE_GLOW,
-            );
+        // Brief white-hot flash at the cell (stage 2+).
+        if st >= 2 {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.06,
+                max_life: 0.06,
+                size: h.max(*w) * 2.4 * (1.0 + 0.6 * od),
+                color: [1.0, 1.0, 1.0, 0.5],
+                kind: SHAPE_DISC,
+                drag: 0.0,
+                spin: false,
+            });
+            // A white slash through the cell sells the "glass cut" moment.
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 1.0,
+                vy: 1.0,
+                ay: 0.0,
+                life: 0.1,
+                max_life: 0.1,
+                size: h.max(*w) * 5.0,
+                color: [1.0, 1.0, 1.0, 0.55],
+                kind: SHAPE_BEAM,
+                drag: 0.0,
+                spin: true,
+            });
+        }
+        // Shockwave ring from stage 2; stage 1 is just shards and sparks.
+        if st >= 2 {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.35 * scale.max(0.5),
+                max_life: 0.35 * scale.max(0.5),
+                size: h.max(*w) * 1.2,
+                color: [c[0], c[1], c[2], 0.75],
+                kind: SHAPE_RING,
+                drag: 0.0,
+                spin: false,
+            });
+        }
+        // Hot sparks unlock at stage 3.
+        if st >= 3 {
+            for _ in 0..(8.0 * density(scale)).round() as usize {
+                let g = 0.5 + rand(&mut self.rng) * 0.4;
+                let life = 0.25 + rand(&mut self.rng) * 0.2;
+                spawn_spark(
+                    &mut self.parts,
+                    &mut self.rng,
+                    *x,
+                    *y,
+                    [1.0, g, 0.2, 1.0],
+                    220.0,
+                    life,
+                    SHAPE_GLOW,
+                );
+            }
+        }
+        // Stage 5 is deliberately excessive: a wide second shockwave, a light
+        // pillar on the cell, and a ring of star satellites around the debris.
+        if st >= 5 {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.42 * scale.max(0.5),
+                max_life: 0.42 * scale.max(0.5),
+                size: h.max(*w) * 2.6,
+                color: [c[0], c[1], c[2], 0.35],
+                kind: SHAPE_RING,
+                drag: 0.0,
+                spin: false,
+            });
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.3 * scale.max(0.5),
+                max_life: 0.3 * scale.max(0.5),
+                size: *h * 7.0,
+                color: [c[0], c[1], c[2], 0.5],
+                kind: SHAPE_BEAM,
+                drag: 0.0,
+                spin: false,
+            });
+            for i in 0..6 {
+                let a = i as f32 * std::f32::consts::TAU / 6.0;
+                let life = 0.35 + rand(&mut self.rng) * 0.2;
+                self.parts.spawn(Particle {
+                    x: *x,
+                    y: *y,
+                    vx: a.cos() * 190.0,
+                    vy: a.sin() * 190.0 - 60.0,
+                    ay: 350.0,
+                    life,
+                    max_life: life,
+                    size: 3.0 + rand(&mut self.rng) * 1.5,
+                    color: brighten(c, 1.2),
+                    kind: SHAPE_STAR,
+                    drag: 0.9,
+                    spin: true,
+                });
+            }
+        }
+        // Variable reward: every 4th impact at max is a nova, so the same
+        // update does not always pay out the same way (habituation).
+        if nova {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.5 * scale.max(0.5),
+                max_life: 0.5 * scale.max(0.5),
+                size: h.max(*w) * 3.6,
+                color: [1.0, 1.0, 1.0, 0.55],
+                kind: SHAPE_RING,
+                drag: 0.0,
+                spin: false,
+            });
+            for i in 0..10 {
+                let a = i as f32 * std::f32::consts::TAU / 10.0 + spread(&mut self.rng, 0.12);
+                let life = 0.45 + rand(&mut self.rng) * 0.2;
+                self.parts.spawn(Particle {
+                    x: *x,
+                    y: *y,
+                    vx: a.cos() * 260.0,
+                    vy: a.sin() * 260.0 - 80.0,
+                    ay: 420.0,
+                    life,
+                    max_life: life,
+                    size: 3.0 + rand(&mut self.rng) * 1.5,
+                    color: brighten(c, 1.35),
+                    kind: SHAPE_STAR,
+                    drag: 0.8,
+                    spin: true,
+                });
+            }
         }
     }
 
@@ -426,12 +712,80 @@ fn palette_pair(rng: &mut u64) -> ([f32; 4], [f32; 4]) {
     )
 }
 
+/// Theme-park accent: four rainbow beams hugging the screen edges. Used at
+/// 0.8+, so it never covers the text.
+fn spawn_edge_pulse(parts: &mut Parts, rng: &mut u64, w: f32, h: f32, scale: f32) {
+    let od = overdrive(scale);
+    if od <= 0.0 {
+        return;
+    }
+    let alpha = 0.2 + 0.25 * od;
+    let life = 0.18 + 0.08 * od;
+    let edges = [
+        (w * 0.5, 4.0, w * 1.05, true),
+        (w * 0.5, h - 4.0, w * 1.05, true),
+        (4.0, h * 0.5, h * 1.05, false),
+        (w - 4.0, h * 0.5, h * 1.05, false),
+    ];
+    for (x, y, size, horizontal) in edges {
+        let color = hsv(rng, 0.75, 1.0);
+        parts.spawn(Particle {
+            x,
+            y,
+            vx: 0.0,
+            vy: if horizontal { 1.0 } else { 0.0 },
+            ay: 0.0,
+            life,
+            max_life: life,
+            size,
+            color: [color[0], color[1], color[2], alpha],
+            kind: SHAPE_BEAM,
+            drag: 0.0,
+            spin: horizontal,
+        });
+    }
+}
+
+/// A Nyan-Cat-style ribbon: seven parallel rainbow beams across the screen.
+fn spawn_rainbow_band(parts: &mut Parts, x: f32, y: f32, w: f32, scale: f32) {
+    let od = overdrive(scale);
+    if od <= 0.0 {
+        return;
+    }
+    for i in 0..7 {
+        let color = hsv_at(i as f32 / 7.0, 0.8, 1.0);
+        let life = 0.22 + 0.02 * i as f32;
+        parts.spawn(Particle {
+            x,
+            y: y + (i as f32 - 3.0) * 5.0,
+            vx: 0.0,
+            vy: 1.0,
+            ay: 0.0,
+            life,
+            max_life: life,
+            size: w * 1.1,
+            color: [color[0], color[1], color[2], 0.14 + 0.14 * od],
+            kind: SHAPE_BEAM,
+            drag: 0.0,
+            spin: true,
+        });
+    }
+}
+
+/// Command completions closer together than this are ignored: rapid commands
+/// must not stack bursts into a flicker.
+const FIREWORKS_COOLDOWN: f32 = 0.18;
+
 /// Command-finished celebration: rockets rise from the cursor, then burst twice.
 pub struct Fireworks {
     parts: Parts,
     rng: u64,
-    /// Pending bursts: (fuse_seconds, x, y, color, accent).
-    pending: Vec<(f32, f32, f32, [f32; 4], [f32; 4])>,
+    /// Pending bursts: (fuse_seconds, x, y, color, accent, scale, jackpot).
+    pending: Vec<(f32, f32, f32, [f32; 4], [f32; 4], f32, bool)>,
+    /// Seconds until the next volley is accepted.
+    cooldown: f32,
+    /// Accepted volleys; every 3rd is a jackpot at 0.8+.
+    bursts: u32,
 }
 
 impl Fireworks {
@@ -440,6 +794,8 @@ impl Fireworks {
             parts: Parts::default(),
             rng: 0x27d4eb2f,
             pending: Vec::new(),
+            cooldown: 0.0,
+            bursts: 0,
         }
     }
 }
@@ -453,11 +809,32 @@ impl Effect for Fireworks {
         let FxEvent::CommandDone { x, y } = ev else {
             return;
         };
-        // Command completion is routine, so it gets a smaller volley than the
-        // once-in-a-while error shower; the full ring pattern still reads.
-        let n = (4.0 * scale).round().max(1.0) as usize;
+        if self.cooldown > 0.0 {
+            return;
+        }
+        self.cooldown = FIREWORKS_COOLDOWN;
+        self.bursts = self.bursts.wrapping_add(1);
+        let od = overdrive(scale);
+        let st = stage(scale);
+        let jackpot = od > 0.5 && self.bursts % 3 == 0;
+        // One rocket per stage, then a final jump at the top of the dial.
+        let mut n = match st {
+            0 | 1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            _ => 5,
+        };
+        if jackpot {
+            n += 1;
+        }
         for i in 0..n {
-            let (color, accent) = palette_pair(&mut self.rng);
+            // 0.8+ uses rainbow shells instead of the fixed palette.
+            let (color, accent) = if od > 0.0 {
+                (hsv(&mut self.rng, 0.7, 1.0), hsv(&mut self.rng, 0.7, 1.0))
+            } else {
+                palette_pair(&mut self.rng)
+            };
             let tx = x + spread(&mut self.rng, 280.0);
             let ty = y - 160.0 - rand(&mut self.rng) * 220.0;
             let fuse = 0.26 + i as f32 * 0.18 + rand(&mut self.rng) * 0.12;
@@ -487,86 +864,97 @@ impl Effect for Fireworks {
                 [1.0, 0.97, 0.85, 0.7],
                 10,
             );
-            self.pending.push((fuse, tx, ty, color, accent));
+            self.pending
+                .push((fuse, tx, ty, color, accent, scale, jackpot));
         }
     }
 
     fn update(&mut self, dt: f32) {
+        self.cooldown = (self.cooldown - dt).max(0.0);
         self.parts.step(dt);
         let mut bursts = Vec::new();
         self.pending.retain_mut(|p| {
             p.0 -= dt;
             if p.0 <= 0.0 {
-                bursts.push((p.1, p.2, p.3, p.4));
+                bursts.push((p.1, p.2, p.3, p.4, p.5, p.6));
                 false
             } else {
                 true
             }
         });
-        for (bx, by, color, accent) in bursts {
+        for (bx, by, color, accent, scale, jackpot) in bursts {
+            let od = overdrive(scale);
+            let st = stage(scale);
+            let dens = density(scale);
             let phase = rand(&mut self.rng) * std::f32::consts::TAU;
-            // Outer shell: evenly spaced diamonds with white-hot cores.
+            // Outer shell: evenly spaced diamonds; cores unlock at stage 4.
             spawn_ring(
                 &mut self.parts,
                 &mut self.rng,
                 bx,
                 by,
                 &Ring {
-                    n: 26,
+                    n: ((14.0 + 2.0 * st as f32) * dens).round().max(4.0) as usize,
                     speed: 220.0,
                     life: 0.9,
                     size: 5.2,
                     kind: SHAPE_DIAMOND,
                     color,
                     phase,
-                    core: true,
+                    core: st >= 4,
                 },
             );
-            // Inner shell: slower stars in the opposite tone, half a step off.
-            spawn_ring(
-                &mut self.parts,
-                &mut self.rng,
-                bx,
-                by,
-                &Ring {
-                    n: 16,
-                    speed: 125.0,
-                    life: 1.05,
-                    size: 4.2,
-                    kind: SHAPE_STAR,
-                    color: with_alpha(accent, 0.78),
-                    phase: std::f32::consts::PI / 16.0,
-                    core: false,
-                },
-            );
-            // Concussive flash at the burst point.
-            self.parts.spawn(Particle {
-                x: bx,
-                y: by,
-                vx: 0.0,
-                vy: 0.0,
-                ay: 0.0,
-                life: 0.26,
-                max_life: 0.26,
-                size: 34.0,
-                color: [1.0, 1.0, 1.0, 0.55],
-                kind: SHAPE_RING,
-                drag: 0.0,
-                spin: false,
-            });
-            // Glitter dust for depth.
-            spawn_burst(
-                &mut self.parts,
-                &mut self.rng,
-                bx,
-                by,
-                16,
-                brighten(color, 1.25),
-                85.0,
-                0.55,
-            );
-            // Secondary micro-burst for extra glitter.
-            if rand(&mut self.rng) < 0.65 {
+            // Inner shell: stage 3 adds the slower opposite-tone stars.
+            if st >= 3 {
+                spawn_ring(
+                    &mut self.parts,
+                    &mut self.rng,
+                    bx,
+                    by,
+                    &Ring {
+                        n: ((8.0 + 2.0 * st as f32) * dens).round().max(2.0) as usize,
+                        speed: 125.0,
+                        life: 1.05,
+                        size: 4.2,
+                        kind: SHAPE_STAR,
+                        color: with_alpha(accent, 0.78),
+                        phase: std::f32::consts::PI / 16.0,
+                        core: false,
+                    },
+                );
+            }
+            // Concussive flash at the burst point; stage 2 and up.
+            if st >= 2 {
+                self.parts.spawn(Particle {
+                    x: bx,
+                    y: by,
+                    vx: 0.0,
+                    vy: 0.0,
+                    ay: 0.0,
+                    life: 0.26,
+                    max_life: 0.26,
+                    size: 34.0 + 12.0 * od,
+                    color: [1.0, 1.0, 1.0, 0.55 + 0.15 * od],
+                    kind: SHAPE_RING,
+                    drag: 0.0,
+                    spin: false,
+                });
+            }
+            // Glitter dust for depth; stage 2 and up.
+            if st >= 2 {
+                spawn_burst(
+                    &mut self.parts,
+                    &mut self.rng,
+                    bx,
+                    by,
+                    ((6.0 + 2.0 * st as f32) * dens).round().max(2.0) as usize,
+                    brighten(color, 1.25),
+                    85.0,
+                    0.55,
+                );
+            }
+            // Secondary micro-burst arrives at stage 4.
+            if st >= 4 {
                 let mx = bx + spread(&mut self.rng, 45.0);
                 let my = by + spread(&mut self.rng, 45.0);
                 spawn_burst(
@@ -574,11 +962,71 @@ impl Effect for Fireworks {
                     &mut self.rng,
                     mx,
                     my,
-                    18,
+                    ((10.0 + 3.0 * st as f32) * dens).round().max(2.0) as usize,
                     brighten(accent, 1.2),
                     95.0,
                     0.45,
                 );
+            }
+            // Theme-park tier: every burst throws a dozen rainbow stars and a
+            // short rainbow ribbon across the burst.
+            if od > 0.0 {
+                spawn_rainbow_band(&mut self.parts, bx, by, 700.0, scale);
+                for _ in 0..12 {
+                    let a = rand(&mut self.rng) * std::f32::consts::TAU;
+                    let v = 120.0 + rand(&mut self.rng) * 220.0;
+                    let life = 0.45 + rand(&mut self.rng) * 0.2;
+                    self.parts.spawn(Particle {
+                        x: bx,
+                        y: by,
+                        vx: a.cos() * v,
+                        vy: a.sin() * v - 40.0,
+                        ay: 260.0,
+                        life,
+                        max_life: life,
+                        size: 2.6 + rand(&mut self.rng) * 1.6,
+                        color: hsv(&mut self.rng, 0.75, 1.0),
+                        kind: SHAPE_STAR,
+                        drag: 0.9,
+                        spin: true,
+                    });
+                }
+            }
+            // Jackpot burst: a white ring plus rainbow star satellites.
+            if jackpot {
+                self.parts.spawn(Particle {
+                    x: bx,
+                    y: by,
+                    vx: 0.0,
+                    vy: 0.0,
+                    ay: 0.0,
+                    life: 0.4,
+                    max_life: 0.4,
+                    size: 130.0,
+                    color: [1.0, 1.0, 1.0, 0.35],
+                    kind: SHAPE_RING,
+                    drag: 0.0,
+                    spin: false,
+                });
+                for i in 0..8 {
+                    let a = i as f32 * std::f32::consts::TAU / 8.0;
+                    let life = 0.4 + rand(&mut self.rng) * 0.2;
+                    let v = 230.0 + rand(&mut self.rng) * 80.0;
+                    self.parts.spawn(Particle {
+                        x: bx,
+                        y: by,
+                        vx: a.cos() * v,
+                        vy: a.sin() * v - 50.0,
+                        ay: 300.0,
+                        life,
+                        max_life: life,
+                        size: 3.2 + rand(&mut self.rng) * 1.5,
+                        color: hsv(&mut self.rng, 0.75, 1.0),
+                        kind: SHAPE_STAR,
+                        drag: 0.8,
+                        spin: true,
+                    });
+                }
             }
         }
     }
@@ -587,7 +1035,7 @@ impl Effect for Fireworks {
         self.parts.collect(out);
     }
     fn active(&self) -> bool {
-        self.parts.alive() || !self.pending.is_empty()
+        self.parts.alive() || !self.pending.is_empty() || self.cooldown > 0.0
     }
 }
 
@@ -600,6 +1048,10 @@ const CONFETTI_COLORS: [[f32; 4]; 6] = [
     [1.0, 0.6, 0.3, 1.0],
 ];
 
+/// Enter bursts closer together than this are ignored: rapid repeats must not
+/// stack into a flicker, and each burst needs a beat to read.
+const CONFETTI_COOLDOWN: f32 = 0.12;
+
 /// Enter: a bullet-hell "spell card" opening — impact core, interleaved star
 /// and diamond rings, a delayed counter-wave, and paper confetti.
 pub struct Confetti {
@@ -607,6 +1059,10 @@ pub struct Confetti {
     rng: u64,
     /// Pending follow-up waves: (delay_seconds, x, y, scale, color).
     pending: Vec<(f32, f32, f32, f32, [f32; 4])>,
+    /// Seconds until the next burst is accepted.
+    cooldown: f32,
+    /// Accepted bursts; every 3rd is a jackpot at 0.8+.
+    bursts: u32,
 }
 
 impl Confetti {
@@ -615,6 +1071,8 @@ impl Confetti {
             parts: Parts::default(),
             rng: 0x51ed270b,
             pending: Vec::new(),
+            cooldown: 0.0,
+            bursts: 0,
         }
     }
 }
@@ -628,7 +1086,20 @@ impl Effect for Confetti {
         let FxEvent::Confetti { x, y, w, h } = ev else {
             return;
         };
-        let (color, accent) = palette_pair(&mut self.rng);
+        if self.cooldown > 0.0 {
+            return;
+        }
+        self.cooldown = CONFETTI_COOLDOWN;
+        self.bursts = self.bursts.wrapping_add(1);
+        let od = overdrive(scale);
+        let st = stage(scale);
+        // 0.8+ turns the palette into a rainbow; every 3rd burst is a jackpot.
+        let (color, accent) = if od > 0.0 {
+            (hsv(&mut self.rng, 0.7, 1.0), hsv(&mut self.rng, 0.7, 1.0))
+        } else {
+            palette_pair(&mut self.rng)
+        };
+        let jackpot = od > 0.5 && self.bursts % 3 == 0;
         // Impact: a small white-hot point plus a crisp shockwave ring. A big
         // soft glow here just reads as a blurry circle over the text.
         self.parts.spawn(Particle {
@@ -645,8 +1116,14 @@ impl Effect for Confetti {
             drag: 0.0,
             spin: false,
         });
-        // Two crisp shockwave rings instead of one thick donut.
-        for (size, alpha, life) in [(58.0, 0.95, 0.22), (128.0, 0.35, 0.3)] {
+        // Crisp shockwave rings instead of one thick donut; the wide one only
+        // appears from stage 2 so low amounts stay local.
+        let waves: &[(f32, f32, f32)] = if st >= 2 {
+            &[(58.0, 0.95, 0.22), (128.0, 0.35, 0.3)]
+        } else {
+            &[(58.0, 0.95, 0.22)]
+        };
+        for (size, alpha, life) in waves {
             self.parts.spawn(Particle {
                 x: *x,
                 y: *y,
@@ -655,8 +1132,8 @@ impl Effect for Confetti {
                 ay: 0.0,
                 life: life * scale.max(0.5),
                 max_life: life * scale.max(0.5),
-                size,
-                color: [color[0], color[1], color[2], alpha],
+                size: *size,
+                color: [color[0], color[1], color[2], *alpha],
                 kind: SHAPE_RING,
                 drag: 0.0,
                 spin: false,
@@ -664,38 +1141,40 @@ impl Effect for Confetti {
         }
         // Crosshair beam: a thin vertical laser from the top edge through the
         // cursor, crossed by a fainter horizontal line on the cursor row.
-        self.parts.spawn(Particle {
-            x: *x,
-            y: *y * 0.5,
-            vx: 0.0,
-            vy: 0.0,
-            ay: 0.0,
-            life: 0.22 * scale.max(0.5),
-            max_life: 0.22 * scale.max(0.5),
-            size: *y,
-            color: [color[0], color[1], color[2], 0.85],
-            kind: SHAPE_BEAM,
-            drag: 0.0,
-            spin: false,
-        });
-        self.parts.spawn(Particle {
-            x: *w * 0.5,
-            y: *y,
-            vx: 0.0,
-            // `Particle` derives rotation from velocity; a hair of downward
-            // velocity turns the beam 90° without visibly moving it.
-            vy: 1.0,
-            ay: 0.0,
-            life: 0.12 * scale.max(0.5),
-            max_life: 0.12 * scale.max(0.5),
-            size: *w * 0.6,
-            color: [accent[0], accent[1], accent[2], 0.35],
-            kind: SHAPE_BEAM,
-            drag: 0.0,
-            spin: true,
-        });
-        // Primary ring: fast stars, each with a white-hot core.
-        let n = (26.0 * scale).round().max(8.0) as usize;
+        if st >= 4 {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y * 0.5,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.22 * scale.max(0.5),
+                max_life: 0.22 * scale.max(0.5),
+                size: *y,
+                color: [color[0], color[1], color[2], 0.85],
+                kind: SHAPE_BEAM,
+                drag: 0.0,
+                spin: false,
+            });
+            self.parts.spawn(Particle {
+                x: *w * 0.5,
+                y: *y,
+                vx: 0.0,
+                // `Particle` derives rotation from velocity; a hair of downward
+                // velocity turns the beam 90° without visibly moving it.
+                vy: 1.0,
+                ay: 0.0,
+                life: 0.12 * scale.max(0.5),
+                max_life: 0.12 * scale.max(0.5),
+                size: *w * 0.6,
+                color: [accent[0], accent[1], accent[2], 0.35],
+                kind: SHAPE_BEAM,
+                drag: 0.0,
+                spin: true,
+            });
+        }
+        // Primary ring: fast stars, white-hot cores from stage 4.
+        let n = ((26.0 + 10.0 * od) * density(scale)).round().max(4.0) as usize;
         spawn_ring(
             &mut self.parts,
             &mut self.rng,
@@ -709,31 +1188,59 @@ impl Effect for Confetti {
                 kind: SHAPE_STAR,
                 color,
                 phase: 0.0,
-                core: true,
+                core: st >= 4,
             },
         );
         // Counter ring: slower diamonds, half a step off so the gap is filled.
-        spawn_ring(
-            &mut self.parts,
-            &mut self.rng,
-            *x,
-            *y,
-            &Ring {
-                n: n / 2 + 5,
-                speed: 150.0,
-                life: 0.95,
-                size: 4.6,
-                kind: SHAPE_DIAMOND,
-                color: with_alpha(accent, 0.85),
-                phase: std::f32::consts::PI / n as f32,
-                core: false,
-            },
-        );
+        if st >= 2 {
+            spawn_ring(
+                &mut self.parts,
+                &mut self.rng,
+                *x,
+                *y,
+                &Ring {
+                    n: n / 2 + 5,
+                    speed: 150.0,
+                    life: 0.95,
+                    size: 4.6,
+                    kind: SHAPE_DIAMOND,
+                    color: with_alpha(accent, 0.85),
+                    phase: std::f32::consts::PI / n as f32,
+                    core: false,
+                },
+            );
+        }
+        // Overdrive: a third, slower star shell between the two rings.
+        if od > 0.0 {
+            let m = (12.0 * od * density(scale)).round().max(1.0) as usize;
+            spawn_ring(
+                &mut self.parts,
+                &mut self.rng,
+                *x,
+                *y,
+                &Ring {
+                    n: m,
+                    speed: 200.0,
+                    life: 0.6,
+                    size: 4.2,
+                    kind: SHAPE_STAR,
+                    color: with_alpha(color, 0.9),
+                    phase: std::f32::consts::PI / m as f32,
+                    core: false,
+                },
+            );
+        }
         // A second wave a beat later keeps the card from ending abruptly.
-        self.pending.push((0.18, *x, *y, scale, accent));
+        if st >= 3 {
+            self.pending.push((0.18, *x, *y, scale, accent));
+        }
+        if od > 0.5 {
+            // Overdrive only: a later echo in the primary tone.
+            self.pending.push((0.34, *x, *y, scale, color));
+        }
         // A few petals around the cursor, not a curtain across the whole
         // screen: Enter is a routine action and must not bury the text.
-        let n = (16.0 * scale).round() as usize;
+        let n = ((16.0 + 8.0 * od) * density(scale)).round() as usize;
         let shapes = [SHAPE_RECT, SHAPE_STAR, SHAPE_DIAMOND, SHAPE_DIAMOND];
         for i in 0..n {
             let life = 0.6 + rand(&mut self.rng) * 0.5;
@@ -754,9 +1261,90 @@ impl Effect for Confetti {
                 spin: true,
             });
         }
+        // Theme-park tier: a rainbow ribbon, an edge frame, and free-floating
+        // sparkles across the whole screen on every burst.
+        if od > 0.0 {
+            spawn_edge_pulse(&mut self.parts, &mut self.rng, *w, *h, scale);
+            spawn_rainbow_band(&mut self.parts, *x, *y, *w, scale);
+            for i in 0..10 {
+                let a = i as f32 * std::f32::consts::TAU / 10.0;
+                let color = hsv(&mut self.rng, 0.75, 1.0);
+                let life = 0.4 + rand(&mut self.rng) * 0.2;
+                let v = 150.0 + rand(&mut self.rng) * 90.0;
+                self.parts.spawn(Particle {
+                    x: *x,
+                    y: *y,
+                    vx: a.cos() * v,
+                    vy: a.sin() * v - 40.0,
+                    ay: 240.0,
+                    life,
+                    max_life: life,
+                    size: 2.6 + rand(&mut self.rng) * 1.4,
+                    color,
+                    kind: SHAPE_STAR,
+                    drag: 0.9,
+                    spin: true,
+                });
+            }
+            for _ in 0..20 {
+                let life = 0.4 + rand(&mut self.rng) * 0.3;
+                self.parts.spawn(Particle {
+                    x: rand(&mut self.rng) * *w,
+                    y: rand(&mut self.rng) * *h,
+                    vx: spread(&mut self.rng, 30.0),
+                    vy: 80.0 + rand(&mut self.rng) * 160.0,
+                    ay: 120.0,
+                    life,
+                    max_life: life,
+                    size: 1.5 + rand(&mut self.rng) * 1.5,
+                    color: hsv(&mut self.rng, 0.8, 1.0),
+                    kind: SHAPE_STAR,
+                    drag: 0.4,
+                    spin: true,
+                });
+            }
+        }
+        // Jackpot: a ring of rainbow stars on top of the usual burst.
+        if jackpot {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.35,
+                max_life: 0.35,
+                size: w.max(*h) * 1.2,
+                color: [1.0, 1.0, 1.0, 0.3],
+                kind: SHAPE_RING,
+                drag: 0.0,
+                spin: false,
+            });
+            for i in 0..20 {
+                let a = i as f32 * std::f32::consts::TAU / 20.0;
+                let color = hsv(&mut self.rng, 0.75, 1.0);
+                let life = 0.4 + rand(&mut self.rng) * 0.2;
+                let v = 200.0 + rand(&mut self.rng) * 90.0;
+                self.parts.spawn(Particle {
+                    x: *x,
+                    y: *y,
+                    vx: a.cos() * v,
+                    vy: a.sin() * v - 40.0,
+                    ay: 260.0,
+                    life,
+                    max_life: life,
+                    size: 3.0 + rand(&mut self.rng) * 1.5,
+                    color,
+                    kind: SHAPE_STAR,
+                    drag: 0.8,
+                    spin: true,
+                });
+            }
+        }
     }
 
     fn update(&mut self, dt: f32) {
+        self.cooldown = (self.cooldown - dt).max(0.0);
         self.parts.step(dt);
         let mut waves = Vec::new();
         self.pending.retain_mut(|p| {
@@ -769,7 +1357,9 @@ impl Effect for Confetti {
             }
         });
         for (wx, wy, scale, color) in waves {
-            let n = (16.0 * scale).round().max(4.0) as usize;
+            let n = ((16.0 + 6.0 * overdrive(scale)) * density(scale))
+                .round()
+                .max(4.0) as usize;
             spawn_ring(
                 &mut self.parts,
                 &mut self.rng,
@@ -792,7 +1382,7 @@ impl Effect for Confetti {
         self.parts.collect(out);
     }
     fn active(&self) -> bool {
-        self.parts.alive() || !self.pending.is_empty()
+        self.parts.alive() || !self.pending.is_empty() || self.cooldown > 0.0
     }
 }
 
@@ -820,7 +1410,7 @@ impl Effect for CursorTrail {
         let FxEvent::CursorMoved { x, y, w, h, dx, dy } = ev else {
             return;
         };
-        let len = (dx.hypot(*dy) * 0.015).clamp(4.0, 18.0) * scale;
+        let len = (dx.hypot(*dy) * 0.015).clamp(4.0, 18.0) * density(scale);
         let vx = *dx * 8.0;
         let vy = *dy * 8.0;
         spawn_comet_tail(
@@ -833,21 +1423,23 @@ impl Effect for CursorTrail {
             [0.55, 0.9, 1.0, 0.6],
             len as usize,
         );
-        // Ghost rect at the departure cell.
-        self.parts.spawn(Particle {
-            x: *x,
-            y: *y,
-            vx: 0.0,
-            vy: 0.0,
-            ay: 0.0,
-            life: 0.18 * scale.max(0.5),
-            max_life: 0.18 * scale.max(0.5),
-            size: h.max(*w) * 1.3,
-            color: [0.55, 0.85, 1.0, 0.5],
-            kind: SHAPE_RECT,
-            drag: 0.0,
-            spin: false,
-        });
+        // Ghost rect at the departure cell; stage 2 and up.
+        if stage(scale) >= 2 {
+            self.parts.spawn(Particle {
+                x: *x,
+                y: *y,
+                vx: 0.0,
+                vy: 0.0,
+                ay: 0.0,
+                life: 0.18 * scale.max(0.5),
+                max_life: 0.18 * scale.max(0.5),
+                size: h.max(*w) * 1.3,
+                color: [0.55, 0.85, 1.0, 0.5],
+                kind: SHAPE_RECT,
+                drag: 0.0,
+                spin: false,
+            });
+        }
     }
 
     fn update(&mut self, dt: f32) {
@@ -873,7 +1465,7 @@ pub struct ScrollTrail {
 const SCROLL_MAX_PARTS: usize = 240;
 /// A single frame never spawns more than this many streaks, however far the
 /// view jumped.
-const SCROLL_MAX_STREAKS: usize = 10;
+const SCROLL_MAX_STREAKS: usize = 12;
 
 impl ScrollTrail {
     pub fn new() -> Self {
@@ -893,41 +1485,60 @@ impl Effect for ScrollTrail {
         let FxEvent::Scrolled { lines, w, h } = ev else {
             return;
         };
-        if *lines == 0 || self.parts.0.len() >= SCROLL_MAX_PARTS {
+        if *lines == 0 || self.parts.0.len() + 2 > SCROLL_MAX_PARTS {
             return;
         }
         let dir = if *lines > 0 { 1.0 } else { -1.0 };
         let lines = (*lines as f32).abs().min(30.0);
-        let n = ((2.0 + lines * 0.7) * scale)
+        let od = overdrive(scale);
+        let n = ((2.0 + lines * 0.7) * density(scale) + 6.0 * od)
             .round()
             .clamp(1.0, SCROLL_MAX_STREAKS as f32) as usize;
-        let len = (18.0 + lines * 0.6).min(26.0) as usize;
+        let len = (48.0 + lines * 3.0).min(110.0) * (0.7 + 0.3 * density(scale));
         for _ in 0..n {
-            // Whole streaks only: a truncated line reads as a glitch.
-            if self.parts.0.len() + len > SCROLL_MAX_PARTS {
+            // One beam is a whole streak: no dotted tail and no vertical bias.
+            if self.parts.0.len() + 2 > SCROLL_MAX_PARTS {
                 return;
             }
             let x = rand(&mut self.rng) * *w;
             let y = rand(&mut self.rng) * *h;
-            let gap = 4.0 + rand(&mut self.rng) * 2.0;
-            for i in 0..len {
-                let t = i as f32 / len as f32;
-                let life = (0.2 + t * 0.25) * scale.max(0.4);
-                self.parts.spawn(Particle {
-                    x: x + spread(&mut self.rng, 1.0),
-                    y: y - dir * i as f32 * gap,
-                    vx: spread(&mut self.rng, 8.0),
-                    vy: dir * 60.0,
-                    ay: 0.0,
-                    life,
-                    max_life: life,
-                    size: 6.5 * (1.0 - t * 0.35),
-                    color: [0.65, 0.9, 1.0, 0.95 * (1.0 - t * 0.55)],
-                    kind: SHAPE_GLOW,
-                    drag: 1.2,
-                    spin: false,
-                });
-            }
+            let speed = 240.0 + lines * 18.0;
+            let color = if scale >= 0.8 {
+                hsv(&mut self.rng, 0.6, 1.0)
+            } else {
+                [0.65, 0.9, 1.0, 1.0]
+            };
+            // Symmetric beam centered on y, moving with the content.
+            self.parts.spawn(Particle {
+                x,
+                y,
+                vx: spread(&mut self.rng, 1.0),
+                vy: dir * speed,
+                ay: 0.0,
+                life: 0.2 + rand(&mut self.rng) * 0.1,
+                max_life: 0.2 + rand(&mut self.rng) * 0.1,
+                size: len,
+                color: [color[0], color[1], color[2], 0.45],
+                kind: SHAPE_BEAM,
+                drag: 1.4,
+                spin: false,
+            });
+            // A bright spark at the leading end gives the direction.
+            let life = 0.12 + rand(&mut self.rng) * 0.06;
+            self.parts.spawn(Particle {
+                x: x + spread(&mut self.rng, 1.0),
+                y: y + dir * len * 0.4,
+                vx: spread(&mut self.rng, 4.0),
+                vy: dir * speed * 1.15,
+                ay: 0.0,
+                life,
+                max_life: life,
+                size: 3.0 + rand(&mut self.rng) * 2.0,
+                color: [color[0], color[1], color[2], 0.9],
+                kind: SHAPE_GLOW,
+                drag: 1.0,
+                spin: false,
+            });
         }
     }
 
@@ -981,7 +1592,8 @@ impl Effect for BellFlash {
             drag: 0.0,
             spin: false,
         });
-        for i in 0..2 {
+        let rings = if stage(scale) >= 2 { 2 } else { 1 };
+        for i in 0..rings {
             self.parts.spawn(Particle {
                 x: *x,
                 y: *y,
@@ -997,7 +1609,7 @@ impl Effect for BellFlash {
                 spin: false,
             });
         }
-        for _ in 0..(6.0 * scale).round() as usize {
+        for _ in 0..(6.0 * density(scale)).round() as usize {
             let (vx, vy) = rand_vec(&mut self.rng, 200.0);
             self.parts.spawn(Particle {
                 x: *x,
@@ -1083,24 +1695,26 @@ impl Effect for WaitPulse {
             drag: 0.0,
             spin: false,
         });
-        for _ in 0..(5.0 * scale).round() as usize {
-            let a = rand(&mut self.rng) * std::f32::consts::TAU;
-            let r = 35.0 + rand(&mut self.rng) * 25.0;
-            let (vx, vy) = rand_vec(&mut self.rng, 18.0);
-            self.parts.spawn(Particle {
-                x: x + a.cos() * r,
-                y: y + a.sin() * r,
-                vx,
-                vy,
-                ay: 0.0,
-                life: 1.2 + rand(&mut self.rng) * 0.6,
-                max_life: 1.2 + rand(&mut self.rng) * 0.6,
-                size: 1.5 + rand(&mut self.rng) * 2.0,
-                color: hsv(&mut self.rng, 0.6, 1.0),
-                kind: SHAPE_STAR,
-                drag: 0.2,
-                spin: true,
-            });
+        if stage(scale) >= 2 {
+            for _ in 0..(5.0 * density(scale)).round() as usize {
+                let a = rand(&mut self.rng) * std::f32::consts::TAU;
+                let r = 35.0 + rand(&mut self.rng) * 25.0;
+                let (vx, vy) = rand_vec(&mut self.rng, 18.0);
+                self.parts.spawn(Particle {
+                    x: x + a.cos() * r,
+                    y: y + a.sin() * r,
+                    vx,
+                    vy,
+                    ay: 0.0,
+                    life: 1.2 + rand(&mut self.rng) * 0.6,
+                    max_life: 1.2 + rand(&mut self.rng) * 0.6,
+                    size: 1.5 + rand(&mut self.rng) * 2.0,
+                    color: hsv(&mut self.rng, 0.6, 1.0),
+                    kind: SHAPE_STAR,
+                    drag: 0.2,
+                    spin: true,
+                });
+            }
         }
     }
 
@@ -1122,6 +1736,12 @@ pub struct OutputRain {
     budget: f32,
     win_w: f32,
     win_h: f32,
+    /// Top-tier storm factor (0 below 0.8, 1.0 at max).
+    boost: f32,
+    /// Sustained-output heat (0..1): rises with output, decays when quiet.
+    heat: f32,
+    /// Seconds until the next edge streak.
+    edge_timer: f32,
 }
 
 impl OutputRain {
@@ -1132,6 +1752,9 @@ impl OutputRain {
             budget: 0.0,
             win_w: 960.0,
             win_h: 600.0,
+            boost: 0.0,
+            heat: 0.0,
+            edge_timer: 0.0,
         }
     }
 }
@@ -1142,6 +1765,20 @@ const RAIN_MAX_PARTS: usize = 220;
 /// Stars spawned per frame; a burst must not become a wall of streaks.
 const RAIN_MAX_SPAWNS: usize = 2;
 
+/// Storm strength blends the top-tier factor with sustained-output heat, so
+/// heavy output ramps up and then settles instead of staying flat.
+fn storm(boost: f32, heat: f32) -> f32 {
+    boost * (0.4 + 0.6 * heat)
+}
+
+fn rain_cap(boost: f32, heat: f32) -> usize {
+    RAIN_MAX_PARTS + (RAIN_MAX_PARTS as f32 * 0.9 * storm(boost, heat)) as usize
+}
+
+fn rain_spawns(boost: f32, heat: f32) -> usize {
+    RAIN_MAX_SPAWNS + (3.0 * storm(boost, heat)) as usize
+}
+
 impl Effect for OutputRain {
     fn name(&self) -> &str {
         "output_rain"
@@ -1149,20 +1786,26 @@ impl Effect for OutputRain {
 
     fn on_event(&mut self, ev: &FxEvent, scale: f32) {
         if let FxEvent::PtyOutput { n, w, h } = ev {
+            self.boost = overdrive(scale);
+            // Sustained output builds heat; short bursts barely move it.
+            self.heat = (self.heat + (*n as f32).sqrt() * 0.004 * density(scale)).min(1.0);
             // Wakeups are coalesced per frame, but their count still grows
             // with throughput; sqrt keeps a big burst from multiplying.
-            self.budget = (self.budget + (*n as f32).sqrt() * 0.10 * scale).min(4.0);
+            self.budget = (self.budget + (*n as f32).sqrt() * 0.10 * density(scale))
+                .min(4.0 + 2.0 * self.boost);
             self.win_w = *w;
             self.win_h = *h;
         }
     }
 
     fn update(&mut self, dt: f32) {
+        self.heat = (self.heat - dt * 0.8).max(0.0);
+        self.edge_timer = (self.edge_timer - dt).max(0.0);
         self.parts.step(dt);
-        let cap = if self.parts.0.len() >= RAIN_MAX_PARTS {
+        let cap = if self.parts.0.len() >= rain_cap(self.boost, self.heat) {
             0
         } else {
-            (self.budget as usize).min(RAIN_MAX_SPAWNS)
+            (self.budget as usize).min(rain_spawns(self.boost, self.heat))
         };
         for _ in 0..cap {
             self.budget -= 1.0;
@@ -1184,7 +1827,39 @@ impl Effect for OutputRain {
                 drag: 0.0,
                 spin: false,
             });
-            spawn_comet_tail(&mut self.parts, &mut self.rng, x, y, -speed, 0.0, color, 6);
+            let tail = 6 + (2.0 * self.boost) as usize;
+            spawn_comet_tail(
+                &mut self.parts,
+                &mut self.rng,
+                x,
+                y,
+                -speed,
+                0.0,
+                color,
+                tail,
+            );
+        }
+        // A hot storm at max also lights the top and bottom edges. Thin,
+        // short-lived, and rate-limited: no full-screen flash.
+        if self.boost > 0.5 && self.heat > 0.6 && self.edge_timer <= 0.0 {
+            self.edge_timer = 0.22;
+            let color = hsv(&mut self.rng, 0.55, 1.0);
+            for y in [6.0, self.win_h - 6.0] {
+                self.parts.spawn(Particle {
+                    x: self.win_w * 0.5,
+                    y,
+                    vx: 0.0,
+                    vy: 1.0,
+                    ay: 0.0,
+                    life: 0.18,
+                    max_life: 0.18,
+                    size: self.win_w * 1.1,
+                    color: [color[0], color[1], color[2], 0.28],
+                    kind: SHAPE_BEAM,
+                    drag: 0.0,
+                    spin: true,
+                });
+            }
         }
     }
 
@@ -1192,7 +1867,7 @@ impl Effect for OutputRain {
         self.parts.collect(out);
     }
     fn active(&self) -> bool {
-        self.parts.alive() || self.budget >= 1.0
+        self.parts.alive() || self.budget >= 1.0 || self.heat > 0.0
     }
 }
 
@@ -1229,7 +1904,7 @@ impl Effect for ProcessError {
         let cx = *x;
         let cy = *y;
         self.floor = *h + 20.0;
-        let mag = (1.0 + (*status as f32).abs() / 64.0).min(3.0) * scale;
+        let mag = (1.0 + (*status as f32).abs() / 64.0).min(3.0) * density(scale);
 
         // Hard practical light flickering at the grinder contact point.
         for _ in 0..(12.0 * mag).round() as usize {
@@ -1352,7 +2027,10 @@ mod tests {
         let mut rain = OutputRain::new();
         rain.on_event(&output_event(10_000), 1.0);
         let peak = rain_peak(&mut rain, 180);
-        assert!(peak <= RAIN_MAX_PARTS, "rain peaked at {peak} particles");
+        assert!(
+            peak <= rain_cap(1.0, 1.0),
+            "max storm peaked at {peak} particles"
+        );
     }
 
     #[test]
@@ -1360,8 +2038,45 @@ mod tests {
         let mut rain = OutputRain::new();
         rain.on_event(&output_event(10_000), 1.0);
         rain.update(1.0 / 60.0);
-        // Each star is the head plus its comet tail.
-        assert!(rain.parts.0.len() <= RAIN_MAX_SPAWNS * 7);
+        // Each star is the head plus its boosted comet tail.
+        let per_star = 1 + 6 + 2;
+        assert!(rain.parts.0.len() <= rain_spawns(1.0, 1.0) * per_star);
+    }
+
+    #[test]
+    fn output_rain_heats_up_and_settles() {
+        let mut rain = OutputRain::new();
+        rain.on_event(&output_event(10_000), 1.0);
+        assert!(rain.heat > 0.4, "a big burst should build heat");
+        for _ in 0..180 {
+            rain.update(1.0 / 60.0);
+        }
+        assert_eq!(rain.heat, 0.0);
+        assert!(!rain.active());
+    }
+
+    #[test]
+    fn edge_streaks_only_appear_in_a_hot_max_storm() {
+        let mut hot = OutputRain::new();
+        hot.boost = 1.0;
+        hot.heat = 1.0;
+        hot.update(1.0 / 60.0);
+        assert_eq!(
+            hot.parts.0.iter().filter(|p| p.kind == SHAPE_BEAM).count(),
+            2
+        );
+        let mut calm = OutputRain::new();
+        calm.heat = 1.0;
+        calm.update(1.0 / 60.0);
+        assert!(!calm.parts.0.iter().any(|p| p.kind == SHAPE_BEAM));
+    }
+
+    #[test]
+    fn output_rain_is_faint_at_the_bottom_of_the_dial() {
+        let mut rain = OutputRain::new();
+        rain.on_event(&output_event(10_000), 0.1);
+        let peak = rain_peak(&mut rain, 30);
+        assert!(peak <= 3, "0.1 should stay restrained, peaked at {peak}");
     }
 
     #[test]
@@ -1499,5 +2214,197 @@ mod tests {
             trail.update(1.0 / 60.0);
         }
         assert!(!trail.active(), "streaks must fade after scrolling stops");
+    }
+
+    fn key_event() -> FxEvent {
+        FxEvent::Key {
+            kind: KeyKind::Char,
+            ch: Some('x'),
+            x: 100.0,
+            y: 100.0,
+        }
+    }
+
+    fn command_done_event() -> FxEvent {
+        FxEvent::CommandDone { x: 200.0, y: 200.0 }
+    }
+
+    fn erased_event() -> FxEvent {
+        FxEvent::Erased {
+            ch: 'x',
+            x: 100.0,
+            y: 100.0,
+            w: 8.0,
+            h: 18.0,
+            color: [1.0, 0.5, 0.3, 1.0],
+        }
+    }
+
+    #[test]
+    fn every_fourth_impact_is_a_nova_at_max() {
+        let mut normal = Shatter::new();
+        normal.on_event(&erased_event(), 1.0);
+        let base = normal.parts.0.len();
+
+        let mut nova = Shatter::new();
+        for _ in 0..3 {
+            nova.on_event(&erased_event(), 1.0);
+        }
+        nova.parts.0.clear();
+        nova.on_event(&erased_event(), 1.0);
+        assert!(
+            nova.parts.0.len() > base,
+            "the 4th impact should pay out more"
+        );
+
+        // Below stage 5 the cadence stays flat.
+        let mut calm_first = Shatter::new();
+        calm_first.on_event(&erased_event(), 0.5);
+        let mut calm = Shatter::new();
+        for _ in 0..3 {
+            calm.on_event(&erased_event(), 0.5);
+        }
+        calm.parts.0.clear();
+        calm.on_event(&erased_event(), 0.5);
+        assert_eq!(calm.parts.0.len(), calm_first.parts.0.len());
+    }
+
+    #[test]
+    fn overdrive_only_unlocks_at_the_top() {
+        assert_eq!(overdrive(0.0), 0.0);
+        assert_eq!(overdrive(0.7), 0.0);
+        assert_eq!(overdrive(0.8), 0.5);
+        assert!((overdrive(0.9) - 0.75).abs() < 1e-6);
+        assert!((overdrive(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stages_unlock_every_two_steps() {
+        assert_eq!(stage(0.0), 0);
+        assert_eq!(stage(0.1), 1);
+        assert_eq!(stage(0.2), 1);
+        assert_eq!(stage(0.3), 2);
+        assert_eq!(stage(0.5), 3);
+        assert_eq!(stage(0.7), 4);
+        assert_eq!(stage(0.9), 5);
+        assert_eq!(stage(1.0), 5);
+    }
+
+    #[test]
+    fn density_rises_at_every_step() {
+        let vals: Vec<f32> = (1..=10).map(|i| density(i as f32 / 10.0)).collect();
+        for w in vals.windows(2) {
+            assert!(
+                w[1] - w[0] >= 0.08,
+                "each 0.1 step should be visible: {vals:?}"
+            );
+        }
+        assert!(density(1.0) > 1.3, "max should overshoot the old ceiling");
+    }
+
+    #[test]
+    fn confetti_unlocks_layers_by_stage() {
+        let mut low = Confetti::new();
+        low.on_event(&enter_event(), 0.1);
+        assert!(!low.parts.0.iter().any(|p| p.kind == SHAPE_DIAMOND));
+        assert!(!low.parts.0.iter().any(|p| p.kind == SHAPE_BEAM));
+        assert!(low.pending.is_empty());
+
+        let mut mid = Confetti::new();
+        mid.on_event(&enter_event(), 0.5);
+        assert!(mid.parts.0.iter().any(|p| p.kind == SHAPE_DIAMOND));
+        assert_eq!(mid.pending.len(), 1);
+        assert!(!mid.parts.0.iter().any(|p| p.kind == SHAPE_BEAM));
+
+        let mut high = Confetti::new();
+        high.on_event(&enter_event(), 1.0);
+        assert!(high.parts.0.iter().any(|p| p.kind == SHAPE_BEAM));
+        assert_eq!(high.pending.len(), 2);
+    }
+
+    #[test]
+    fn fireworks_add_a_rocket_per_stage() {
+        let mut low = Fireworks::new();
+        low.on_event(&command_done_event(), 0.1);
+        assert_eq!(low.pending.len(), 1);
+        let mut mid = Fireworks::new();
+        mid.on_event(&command_done_event(), 0.5);
+        assert_eq!(mid.pending.len(), 3);
+        let mut high = Fireworks::new();
+        high.on_event(&command_done_event(), 1.0);
+        assert_eq!(high.pending.len(), 5);
+    }
+
+    #[test]
+    fn combo_tracks_fast_typing_and_resets_when_idle() {
+        let mut sparks = Sparks::new();
+        sparks.on_event(&key_event(), 1.0);
+        assert_eq!(sparks.combo, 1);
+        sparks.update(0.2);
+        sparks.on_event(&key_event(), 1.0);
+        assert_eq!(sparks.combo, 2);
+        sparks.update(COMBO_RESET + 0.01);
+        assert_eq!(sparks.combo, 0);
+    }
+
+    #[test]
+    fn overdrive_typing_earns_milestone_stars() {
+        let mut hot = Sparks::new();
+        for _ in 0..10 {
+            hot.on_event(&key_event(), 1.0);
+            hot.update(0.1);
+        }
+        assert!(
+            hot.parts.0.iter().any(|p| p.kind == SHAPE_STAR),
+            "max amount should celebrate every 10 keys"
+        );
+        let mut calm = Sparks::new();
+        for _ in 0..10 {
+            calm.on_event(&key_event(), 0.4);
+            calm.update(0.1);
+        }
+        assert!(
+            !calm.parts.0.iter().any(|p| p.kind == SHAPE_STAR),
+            "lower amounts only celebrate at 25/50"
+        );
+    }
+
+    #[test]
+    fn rapid_enter_bursts_wait_for_the_cooldown() {
+        let mut confetti = Confetti::new();
+        confetti.on_event(&enter_event(), 1.0);
+        let first = confetti.parts.0.len();
+        confetti.on_event(&enter_event(), 1.0);
+        assert_eq!(confetti.parts.0.len(), first, "second burst must wait");
+        confetti.update(CONFETTI_COOLDOWN + 0.01);
+        let before = confetti.parts.0.len();
+        confetti.on_event(&enter_event(), 1.0);
+        assert!(confetti.parts.0.len() > before);
+    }
+
+    #[test]
+    fn rapid_command_completions_wait_for_the_cooldown() {
+        let mut fireworks = Fireworks::new();
+        fireworks.on_event(&command_done_event(), 1.0);
+        let first = fireworks.pending.len();
+        assert!(first > 0);
+        fireworks.on_event(&command_done_event(), 1.0);
+        assert_eq!(fireworks.pending.len(), first, "second volley must wait");
+        fireworks.update(FIREWORKS_COOLDOWN + 0.01);
+        fireworks.on_event(&command_done_event(), 1.0);
+        assert_eq!(fireworks.pending.len(), first * 2);
+    }
+
+    #[test]
+    fn max_amount_adds_layers_without_covering_more_screen() {
+        let mut hot = Confetti::new();
+        hot.on_event(&enter_event(), 1.0);
+        let mut calm = Confetti::new();
+        calm.on_event(&enter_event(), 0.8);
+        let stars = |c: &Confetti| c.parts.0.iter().filter(|p| p.kind == SHAPE_STAR).count();
+        assert!(
+            stars(&hot) > stars(&calm),
+            "overdrive must add bullet layers, not just brighten"
+        );
     }
 }
