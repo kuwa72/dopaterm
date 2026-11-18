@@ -282,8 +282,14 @@ impl App {
         let Some(old_win) = self.window.take() else {
             return;
         };
-        let size = old_win.inner_size();
+        let mut size = old_win.inner_size();
         let pos = old_win.outer_position().ok();
+        // A display-config change can leave the old window at 0/1px or on a
+        // disconnected monitor; recreating with that geometry produces a
+        // window the user can never reach again.
+        if size.width < 32 || size.height < 32 {
+            size = winit::dpi::PhysicalSize::new(960, 600);
+        }
         // Hide the old window first: its leaked surface holds an
         // Arc<Window> and keeps the HWND alive — left visible it would
         // sit on screen frozen forever.
@@ -298,7 +304,14 @@ impl App {
             .with_title("dopaterm")
             .with_window_icon(window_icon())
             .with_inner_size(size);
-        if let Some(p) = pos {
+        let on_screen = pos.is_some_and(|p| {
+            el.available_monitors().any(|m| {
+                let mp = m.position();
+                let ms = m.size();
+                rects_overlap((p.x, p.y), (size.width, size.height), (mp.x, mp.y), (ms.width, ms.height))
+            })
+        });
+        if let (Some(p), true) = (pos, on_screen) {
             attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(p.x, p.y));
         }
         match el.create_window(attrs) {
@@ -369,6 +382,9 @@ impl App {
         };
         let Some(term) = &self.term else { return };
         let size = self.window.as_ref().unwrap().inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
         let ws = alacritty_terminal::event::WindowSize {
             num_cols: ((size.width as f32 / r.cell_w) as u16).max(1),
             num_lines: ((size.height as f32 / r.cell_h) as u16).max(1),
@@ -1645,6 +1661,14 @@ fn is_heavy_update(scrolled: bool, changed_cells: usize, cells: usize) -> bool {
     scrolled || changed_cells * 8 >= cells
 }
 
+/// True when two axis-aligned rects share at least one pixel.
+fn rects_overlap(p1: (i32, i32), s1: (u32, u32), p2: (i32, i32), s2: (u32, u32)) -> bool {
+    p1.0 + s1.0 as i32 > p2.0
+        && p2.0 + s2.0 as i32 > p1.0
+        && p1.1 + s1.1 as i32 > p2.1
+        && p2.1 + s2.1 as i32 > p1.1
+}
+
 fn row_has_content(row: &[SnapCell]) -> bool {
     row.iter().any(|c| !matches!(c.0, ' ' | '\0'))
 }
@@ -2086,6 +2110,25 @@ mod tests {
     }
 
     #[test]
+    fn rects_overlap_detects_on_screen_and_off_screen() {
+        let monitor = ((0, 0), (1920, 1080));
+        assert!(rects_overlap((100, 100), (960, 600), monitor.0, monitor.1));
+        // Partially off the right edge still counts as reachable.
+        assert!(rects_overlap((1900, 100), (960, 600), monitor.0, monitor.1));
+        // A monitor that was unplugged leaves the window fully outside.
+        assert!(!rects_overlap((2000, 100), (960, 600), monitor.0, monitor.1));
+        assert!(!rects_overlap((0, -600), (960, 600), monitor.0, monitor.1));
+        // Negative-position second monitor (left of primary) still counts.
+        assert!(!rects_overlap((-1920, 0), (960, 600), monitor.0, monitor.1));
+        assert!(rects_overlap(
+            (-1920, 0),
+            (960, 600),
+            (-1920, 0),
+            (1920, 1080)
+        ));
+    }
+
+    #[test]
     fn a_moderate_redraw_still_shatters_a_few_cells() {
         // 100 of 1000 cells go blank: enough to be an update, not a scroll.
         let mut old = vec![cell(' '); 1000];
@@ -2180,6 +2223,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Resized(size) => {
+                if size.width == 0 || size.height == 0 {
+                    return; // minimized: keep the last real grid size
+                }
                 if let Some(r) = &mut self.renderer {
                     // surface.configure can panic on a dead device.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
