@@ -12,6 +12,8 @@ mod mouse_inject;
 mod render;
 mod settings_ui;
 mod term_core;
+#[cfg(windows)]
+mod win32drag;
 
 use std::path::PathBuf;
 

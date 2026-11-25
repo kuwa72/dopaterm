@@ -318,6 +318,8 @@ impl App {
             Ok(w) => {
                 let window = Arc::new(w);
                 window.set_ime_allowed(!self.show_settings);
+                #[cfg(windows)]
+                crate::win32drag::install(&window);
                 self.window = Some(window);
                 self.recreate_renderer();
                 eprintln!("dopaterm: window recreated after GPU change");
@@ -2154,6 +2156,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         window.set_ime_allowed(true);
+        #[cfg(windows)]
+        crate::win32drag::install(&window);
         let mut renderer = pollster::block_on(Renderer::new(
             Arc::clone(&window),
             self.cfg.font_size,
